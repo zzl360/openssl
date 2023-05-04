@@ -466,10 +466,8 @@ static int drbg_hash_set_ctx_params(void *vctx, const OSSL_PARAM params[])
 
     md = ossl_prov_digest_md(&hash->digest);
     if (md != NULL) {
-        if ((EVP_MD_get_flags(md) & EVP_MD_FLAG_XOF) != 0) {
-            ERR_raise(ERR_LIB_PROV, PROV_R_XOF_DIGESTS_NOT_ALLOWED);
-            return 0;
-        }
+        if (!ossl_drbg_verify_digest(libctx, md))
+            return 0;   /* Error already raised for us */
 
         /* These are taken from SP 800-90 10.1 Table 2 */
         hash->blocklen = EVP_MD_get_size(md);
@@ -523,5 +521,5 @@ const OSSL_DISPATCH ossl_drbg_hash_functions[] = {
       (void(*)(void))drbg_hash_verify_zeroization },
     { OSSL_FUNC_RAND_GET_SEED, (void(*)(void))ossl_drbg_get_seed },
     { OSSL_FUNC_RAND_CLEAR_SEED, (void(*)(void))ossl_drbg_clear_seed },
-    { 0, NULL }
+    OSSL_DISPATCH_END
 };

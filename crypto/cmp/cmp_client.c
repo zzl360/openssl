@@ -63,10 +63,10 @@ static int unprotected_exception(const OSSL_CMP_CTX *ctx,
         break;
     default:
         if (IS_CREP(rcvd_type)) {
+            int any_rid = OSSL_CMP_CERTREQID_NONE;
             OSSL_CMP_CERTREPMESSAGE *crepmsg = rep->body->value.ip;
             OSSL_CMP_CERTRESPONSE *crep =
-                ossl_cmp_certrepmessage_get0_certresponse(crepmsg,
-                                                          -1 /* any rid */);
+                ossl_cmp_certrepmessage_get0_certresponse(crepmsg, any_rid);
 
             if (sk_OSSL_CMP_CERTRESPONSE_num(crepmsg->response) > 1)
                 return -1;
@@ -122,13 +122,13 @@ static int save_statusInfo(OSSL_CMP_CTX *ctx, OSSL_CMP_PKISI *si)
 static int send_receive_check(OSSL_CMP_CTX *ctx, const OSSL_CMP_MSG *req,
                               OSSL_CMP_MSG **rep, int expected_type)
 {
-    int is_enrollment = IS_CREP(expected_type)
-        || expected_type == OSSL_CMP_PKIBODY_POLLREP
-        || expected_type == OSSL_CMP_PKIBODY_PKICONF;
+    int begin_transaction =
+        expected_type != OSSL_CMP_PKIBODY_POLLREP
+        && expected_type != OSSL_CMP_PKIBODY_PKICONF;
     const char *req_type_str =
         ossl_cmp_bodytype_to_string(OSSL_CMP_MSG_get_bodytype(req));
     const char *expected_type_str = ossl_cmp_bodytype_to_string(expected_type);
-    int msg_timeout;
+    int bak_msg_timeout = ctx->msg_timeout;
     int bt;
     time_t now = time(NULL);
     int time_left;
@@ -136,15 +136,16 @@ static int send_receive_check(OSSL_CMP_CTX *ctx, const OSSL_CMP_MSG *req,
 
     if (transfer_cb == NULL)
         transfer_cb = OSSL_CMP_MSG_http_perform;
-
     *rep = NULL;
-    msg_timeout = ctx->msg_timeout; /* backup original value */
-    if (is_enrollment && ctx->total_timeout > 0 /* timeout is not infinite */) {
+
+    if (ctx->total_timeout != 0 /* not waiting indefinitely */) {
+        if (begin_transaction)
+            ctx->end_time = now + ctx->total_timeout;
         if (now >= ctx->end_time) {
             ERR_raise(ERR_LIB_CMP, CMP_R_TOTAL_TIMEOUT);
             return 0;
         }
-        if (!ossl_assert(ctx->end_time - time(NULL) < INT_MAX)) {
+        if (!ossl_assert(ctx->end_time - now < INT_MAX)) {
             /* actually cannot happen due to assignment in initial_certreq() */
             ERR_raise(ERR_LIB_CMP, CMP_R_INVALID_ARGS);
             return 0;
@@ -160,11 +161,11 @@ static int send_receive_check(OSSL_CMP_CTX *ctx, const OSSL_CMP_MSG *req,
     ossl_cmp_log1(INFO, ctx, "sending %s", req_type_str);
 
     *rep = (*transfer_cb)(ctx, req);
-    ctx->msg_timeout = msg_timeout; /* restore original value */
+    ctx->msg_timeout = bak_msg_timeout;
 
     if (*rep == NULL) {
         ERR_raise_data(ERR_LIB_CMP,
-                       ctx->total_timeout > 0 && time(NULL) >= ctx->end_time ?
+                       ctx->total_timeout != 0 && time(NULL) >= ctx->end_time ?
                        CMP_R_TOTAL_TIMEOUT : CMP_R_TRANSFER_ERROR,
                        "request sent: %s, expected response: %s",
                        req_type_str, expected_type_str);
@@ -236,7 +237,7 @@ static int send_receive_check(OSSL_CMP_CTX *ctx, const OSSL_CMP_MSG *req,
  * On receiving a pollRep, which includes a checkAfter value, it return this
  * value if sleep == 0, else it sleeps as long as indicated and retries.
  *
- * A transaction timeout is enabled if ctx->total_timeout is > 0.
+ * A transaction timeout is enabled if ctx->total_timeout is != 0.
  * In this case polling will continue until the timeout is reached and then
  * polling is done a last time even if this is before the "checkAfter" time.
  *
@@ -308,7 +309,7 @@ static int poll_for_response(OSSL_CMP_CTX *ctx, int sleep, int rid,
                           "received polling response%s; checkAfter = %ld seconds",
                           str, check_after);
 
-            if (ctx->total_timeout > 0) { /* timeout is not infinite */
+            if (ctx->total_timeout != 0) { /* timeout is not infinite */
                 const int exp = 5; /* expected max time per msg round trip */
                 int64_t time_left = (int64_t)(ctx->end_time - exp - time(NULL));
 
@@ -355,15 +356,16 @@ static int poll_for_response(OSSL_CMP_CTX *ctx, int sleep, int rid,
  * Send certConf for IR, CR or KUR sequences and check response,
  * not modifying ctx->status during the certConf exchange
  */
-int ossl_cmp_exchange_certConf(OSSL_CMP_CTX *ctx, int fail_info,
-                               const char *txt)
+int ossl_cmp_exchange_certConf(OSSL_CMP_CTX *ctx, int certReqId,
+                               int fail_info, const char *txt)
 {
     OSSL_CMP_MSG *certConf;
     OSSL_CMP_MSG *PKIconf = NULL;
     int res = 0;
 
     /* OSSL_CMP_certConf_new() also checks if all necessary options are set */
-    if ((certConf = ossl_cmp_certConf_new(ctx, fail_info, txt)) == NULL)
+    certConf = ossl_cmp_certConf_new(ctx, certReqId, fail_info, txt);
+    if (certConf == NULL)
         goto err;
 
     res = send_receive_check(ctx, certConf, &PKIconf, OSSL_CMP_PKIBODY_PKICONF);
@@ -492,18 +494,46 @@ int OSSL_CMP_certConf_cb(OSSL_CMP_CTX *ctx, X509 *cert, int fail_info,
     if (fail_info != 0) /* accept any error flagged by CMP core library */
         return fail_info;
 
-    ossl_cmp_debug(ctx, "trying to build chain for newly enrolled cert");
-    chain = X509_build_chain(cert, ctx->untrusted, out_trusted /* maybe NULL */,
-                             0, ctx->libctx, ctx->propq);
+    if (out_trusted == NULL) {
+        ossl_cmp_debug(ctx, "trying to build chain for newly enrolled cert");
+        chain = X509_build_chain(cert, ctx->untrusted, out_trusted,
+                                 0, ctx->libctx, ctx->propq);
+    } else {
+        X509_STORE_CTX *csc = X509_STORE_CTX_new_ex(ctx->libctx, ctx->propq);
+
+        ossl_cmp_debug(ctx, "validating newly enrolled cert");
+        if (csc == NULL)
+            goto err;
+        if (!X509_STORE_CTX_init(csc, out_trusted, cert, ctx->untrusted))
+            goto err;
+        /* disable any cert status/revocation checking etc. */
+        X509_VERIFY_PARAM_clear_flags(X509_STORE_CTX_get0_param(csc),
+                                      ~(X509_V_FLAG_USE_CHECK_TIME
+                                        | X509_V_FLAG_NO_CHECK_TIME
+                                        | X509_V_FLAG_PARTIAL_CHAIN
+                                        | X509_V_FLAG_POLICY_CHECK));
+        if (X509_verify_cert(csc) <= 0)
+            goto err;
+
+        if (!ossl_x509_add_certs_new(&chain,  X509_STORE_CTX_get0_chain(csc),
+                                     X509_ADD_FLAG_UP_REF | X509_ADD_FLAG_NO_DUP
+                                     | X509_ADD_FLAG_NO_SS)) {
+            sk_X509_free(chain);
+            chain = NULL;
+        }
+    err:
+        X509_STORE_CTX_free(csc);
+    }
+
     if (sk_X509_num(chain) > 0)
         X509_free(sk_X509_shift(chain)); /* remove leaf (EE) cert */
     if (out_trusted != NULL) {
         if (chain == NULL) {
-            ossl_cmp_err(ctx, "failed building chain for newly enrolled cert");
+            ossl_cmp_err(ctx, "failed to validate newly enrolled cert");
             fail_info = 1 << OSSL_CMP_PKIFAILUREINFO_incorrectData;
         } else {
             ossl_cmp_debug(ctx,
-                           "succeeded building proper chain for newly enrolled cert");
+                           "success validating newly enrolled cert");
         }
     } else if (chain == NULL) {
         ossl_cmp_warn(ctx, "could not build approximate chain for newly enrolled cert, resorting to received extraCerts");
@@ -520,6 +550,7 @@ int OSSL_CMP_certConf_cb(OSSL_CMP_CTX *ctx, X509 *cert, int fail_info,
 
 /*-
  * Perform the generic handling of certificate responses for IR/CR/KUR/P10CR.
+ * |rid| must be OSSL_CMP_CERTREQID_NONE if not available, namely for p10cr
  * Returns -1 on receiving pollRep if sleep == 0, setting the checkAfter value.
  * Returns 1 on success and provides the received PKIMESSAGE in *resp.
  * Returns 0 on error (which includes the case that timeout has been reached).
@@ -553,10 +584,9 @@ static int cert_response(OSSL_CMP_CTX *ctx, int sleep, int rid,
         return 0;
     if (!save_statusInfo(ctx, crep->status))
         return 0;
-    if (rid == -1) {
-        /* for OSSL_CMP_PKIBODY_P10CR learn CertReqId from response */
+    if (rid == OSSL_CMP_CERTREQID_NONE) { /* used for OSSL_CMP_PKIBODY_P10CR */
         rid = ossl_cmp_asn1_get_int(crep->certReqId);
-        if (rid == -1) {
+        if (rid != OSSL_CMP_CERTREQID_NONE) {
             ERR_raise(ERR_LIB_CMP, CMP_R_BAD_REQUEST_ID);
             return 0;
         }
@@ -620,7 +650,7 @@ static int cert_response(OSSL_CMP_CTX *ctx, int sleep, int rid,
                       "rejecting newly enrolled cert with subject: %s", subj);
     if (!ctx->disableConfirm
             && !ossl_cmp_hdr_has_implicitConfirm((*resp)->header)) {
-        if (!ossl_cmp_exchange_certConf(ctx, fail_info, txt))
+        if (!ossl_cmp_exchange_certConf(ctx, rid, fail_info, txt))
             ret = 0;
     }
 
@@ -629,6 +659,7 @@ static int cert_response(OSSL_CMP_CTX *ctx, int sleep, int rid,
         ERR_raise_data(ERR_LIB_CMP, CMP_R_CERTIFICATE_NOT_ACCEPTED,
                        "rejecting newly enrolled cert with subject: %s; %s",
                        subj, txt);
+        ctx->status = OSSL_CMP_PKISTATUS_rejection;
         ret = 0;
     }
     OPENSSL_free(subj);
@@ -646,9 +677,6 @@ static int initial_certreq(OSSL_CMP_CTX *ctx,
     if (!ossl_cmp_ctx_set0_newCert(ctx, NULL))
         return 0;
 
-    if (ctx->total_timeout > 0) /* else ctx->end_time is not used */
-        ctx->end_time = time(NULL) + ctx->total_timeout;
-
     /* also checks if all necessary options are set */
     if ((req = ossl_cmp_certreq_new(ctx, req_type, crm)) == NULL)
         return 0;
@@ -664,7 +692,7 @@ int OSSL_CMP_try_certreq(OSSL_CMP_CTX *ctx, int req_type,
 {
     OSSL_CMP_MSG *rep = NULL;
     int is_p10 = req_type == OSSL_CMP_PKIBODY_P10CR;
-    int rid = is_p10 ? -1 : OSSL_CMP_CERTREQID;
+    int rid = is_p10 ? OSSL_CMP_CERTREQID_NONE : OSSL_CMP_CERTREQID;
     int rep_type = is_p10 ? OSSL_CMP_PKIBODY_CP : req_type + 1;
     int res = 0;
 
@@ -705,7 +733,7 @@ X509 *OSSL_CMP_exec_certreq(OSSL_CMP_CTX *ctx, int req_type,
 {
     OSSL_CMP_MSG *rep = NULL;
     int is_p10 = req_type == OSSL_CMP_PKIBODY_P10CR;
-    int rid = is_p10 ? -1 : OSSL_CMP_CERTREQID;
+    int rid = is_p10 ? OSSL_CMP_CERTREQID_NONE : OSSL_CMP_CERTREQID;
     int rep_type = is_p10 ? OSSL_CMP_PKIBODY_CP : req_type + 1;
     X509 *result = NULL;
 

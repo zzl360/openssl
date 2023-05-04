@@ -407,36 +407,6 @@ int ossl_set_tls_provider_parameters(OSSL_RECORD_LAYER *rl,
                                      const EVP_CIPHER *ciph,
                                      const EVP_MD *md);
 
-/* tls_pad.c */
-int ssl3_cbc_remove_padding_and_mac(size_t *reclen,
-                                    size_t origreclen,
-                                    unsigned char *recdata,
-                                    unsigned char **mac,
-                                    int *alloced,
-                                    size_t block_size, size_t mac_size,
-                                    OSSL_LIB_CTX *libctx);
-
-int tls1_cbc_remove_padding_and_mac(size_t *reclen,
-                                    size_t origreclen,
-                                    unsigned char *recdata,
-                                    unsigned char **mac,
-                                    int *alloced,
-                                    size_t block_size, size_t mac_size,
-                                    int aead,
-                                    OSSL_LIB_CTX *libctx);
-
-/* ssl3_cbc.c */
-__owur char ssl3_cbc_record_digest_supported(const EVP_MD_CTX *ctx);
-__owur int ssl3_cbc_digest_record(const EVP_MD *md,
-                                  unsigned char *md_out,
-                                  size_t *md_out_size,
-                                  const unsigned char *header,
-                                  const unsigned char *data,
-                                  size_t data_size,
-                                  size_t data_plus_mac_plus_padding_size,
-                                  const unsigned char *mac_secret,
-                                  size_t mac_secret_length, char is_sslv3);
-
 int tls_increment_sequence_ctr(OSSL_RECORD_LAYER *rl);
 int tls_alloc_buffers(OSSL_RECORD_LAYER *rl);
 int tls_free_buffers(OSSL_RECORD_LAYER *rl);
@@ -478,7 +448,6 @@ tls_int_new_record_layer(OSSL_LIB_CTX *libctx, const char *propq, int vers,
                          const OSSL_DISPATCH *fns, void *cbarg,
                          OSSL_RECORD_LAYER **retrl);
 int tls_free(OSSL_RECORD_LAYER *rl);
-int tls_reset(OSSL_RECORD_LAYER *rl);
 int tls_unprocessed_read_pending(OSSL_RECORD_LAYER *rl);
 int tls_processed_read_pending(OSSL_RECORD_LAYER *rl);
 size_t tls_app_data_pending(OSSL_RECORD_LAYER *rl);
@@ -490,9 +459,9 @@ int tls_retry_write_records(OSSL_RECORD_LAYER *rl);
 int tls_get_alert_code(OSSL_RECORD_LAYER *rl);
 int tls_set1_bio(OSSL_RECORD_LAYER *rl, BIO *bio);
 int tls_read_record(OSSL_RECORD_LAYER *rl, void **rechandle, int *rversion,
-                    int *type, unsigned char **data, size_t *datalen,
+                    int *type, const unsigned char **data, size_t *datalen,
                     uint16_t *epoch, unsigned char *seq_num);
-int tls_release_record(OSSL_RECORD_LAYER *rl, void *rechandle);
+int tls_release_record(OSSL_RECORD_LAYER *rl, void *rechandle, size_t length);
 int tls_default_set_protocol_version(OSSL_RECORD_LAYER *rl, int version);
 int tls_set_protocol_version(OSSL_RECORD_LAYER *rl, int version);
 void tls_set_plain_alerts(OSSL_RECORD_LAYER *rl, int allow);

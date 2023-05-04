@@ -793,8 +793,8 @@ int ossl_cmp_certstatus_set0_certHash(OSSL_CMP_CERTSTATUS *certStatus,
     return 1;
 }
 
-OSSL_CMP_MSG *ossl_cmp_certConf_new(OSSL_CMP_CTX *ctx, int fail_info,
-                                    const char *text)
+OSSL_CMP_MSG *ossl_cmp_certConf_new(OSSL_CMP_CTX *ctx, int certReqId,
+                                    int fail_info, const char *text)
 {
     OSSL_CMP_MSG *msg = NULL;
     OSSL_CMP_CERTSTATUS *certStatus = NULL;
@@ -803,7 +803,9 @@ OSSL_CMP_MSG *ossl_cmp_certConf_new(OSSL_CMP_CTX *ctx, int fail_info,
     ASN1_OCTET_STRING *certHash = NULL;
     OSSL_CMP_PKISI *sinfo;
 
-    if (!ossl_assert(ctx != NULL && ctx->newCert != NULL))
+    if (!ossl_assert(ctx != NULL && ctx->newCert != NULL
+                     && (certReqId == OSSL_CMP_CERTREQID
+                         || certReqId == OSSL_CMP_CERTREQID_NONE)))
         return NULL;
 
     if ((unsigned)fail_info > OSSL_CMP_PKIFAILUREINFO_MAX_BIT_PATTERN) {
@@ -817,11 +819,15 @@ OSSL_CMP_MSG *ossl_cmp_certConf_new(OSSL_CMP_CTX *ctx, int fail_info,
     if ((certStatus = OSSL_CMP_CERTSTATUS_new()) == NULL)
         goto err;
     /* consume certStatus into msg right away so it gets deallocated with msg */
-    if (!sk_OSSL_CMP_CERTSTATUS_push(msg->body->value.certConf, certStatus))
+    if (sk_OSSL_CMP_CERTSTATUS_push(msg->body->value.certConf, certStatus) < 1) {
+        OSSL_CMP_CERTSTATUS_free(certStatus);
         goto err;
+    }
+
     /* set the ID of the certReq */
-    if (!ASN1_INTEGER_set(certStatus->certReqId, OSSL_CMP_CERTREQID))
+    if (!ASN1_INTEGER_set(certStatus->certReqId, certReqId))
         goto err;
+
     certStatus->hashAlg = NULL;
     /*
      * The hash of the certificate, using the same hash algorithm
@@ -975,12 +981,12 @@ static int suitable_rid(const ASN1_INTEGER *certReqId, int rid)
 {
     int trid;
 
-    if (rid == -1)
+    if (rid == OSSL_CMP_CERTREQID_NONE)
         return 1;
 
     trid = ossl_cmp_asn1_get_int(certReqId);
 
-    if (trid == -1) {
+    if (trid == OSSL_CMP_CERTREQID_NONE) {
         ERR_raise(ERR_LIB_CMP, CMP_R_BAD_REQUEST_ID);
         return 0;
     }
@@ -1092,6 +1098,20 @@ int OSSL_CMP_MSG_update_transactionID(OSSL_CMP_CTX *ctx, OSSL_CMP_MSG *msg)
         return 0;
     return msg->header->protectionAlg == NULL
             || ossl_cmp_msg_protect(ctx, msg);
+}
+
+int OSSL_CMP_MSG_update_recipNonce(OSSL_CMP_CTX *ctx, OSSL_CMP_MSG *msg)
+{
+    if (ctx == NULL || msg == NULL || msg->header == NULL) {
+        ERR_raise(ERR_LIB_CMP, CMP_R_NULL_ARGUMENT);
+        return 0;
+    }
+    if (ctx->recipNonce == NULL) /* nothing to do for 1st msg in transaction */
+        return 1;
+    if (!ossl_cmp_asn1_octet_string_set1(&msg->header->recipNonce,
+                                         ctx->recipNonce))
+        return 0;
+    return msg->header->protectionAlg == NULL || ossl_cmp_msg_protect(ctx, msg);
 }
 
 OSSL_CMP_MSG *OSSL_CMP_MSG_read(const char *file, OSSL_LIB_CTX *libctx,

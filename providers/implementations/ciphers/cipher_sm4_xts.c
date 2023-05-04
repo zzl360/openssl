@@ -145,14 +145,14 @@ static int sm4_xts_cipher(void *vctx, unsigned char *out, size_t *outl,
     if (ctx->xts_standard) {
         if (ctx->stream != NULL)
             (*ctx->stream)(in, out, inl, ctx->xts.key1, ctx->xts.key2,
-                           ctx->base.iv);
+                           ctx->base.iv, ctx->base.enc);
         else if (CRYPTO_xts128_encrypt(&ctx->xts, ctx->base.iv, in, out, inl,
                                        ctx->base.enc))
             return 0;
     } else {
         if (ctx->stream_gb != NULL)
             (*ctx->stream_gb)(in, out, inl, ctx->xts.key1, ctx->xts.key2,
-                              ctx->base.iv);
+                              ctx->base.iv, ctx->base.enc);
         else if (ossl_crypto_xts128gb_encrypt(&ctx->xts, ctx->base.iv, in, out,
                                               inl, ctx->base.enc))
             return 0;
@@ -275,7 +275,7 @@ const OSSL_DISPATCH ossl_sm4##kbits##xts_functions[] = {                       \
       (void (*)(void))sm4_xts_set_ctx_params },                                \
     { OSSL_FUNC_CIPHER_SETTABLE_CTX_PARAMS,                                    \
      (void (*)(void))sm4_xts_settable_ctx_params },                            \
-    { 0, NULL }                                                                \
+    OSSL_DISPATCH_END                                                          \
 }
 /* ossl_sm4128xts_functions */
 IMPLEMENT_cipher(xts, XTS, 128, SM4_XTS_FLAGS);

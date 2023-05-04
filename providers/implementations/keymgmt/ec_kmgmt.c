@@ -1006,10 +1006,10 @@ static void *ec_gen_init(void *provctx, int selection,
         gctx->libctx = libctx;
         gctx->selection = selection;
         gctx->ecdh_mode = 0;
-    }
-    if (!ec_gen_set_params(gctx, params)) {
-        OPENSSL_free(gctx);
-        gctx = NULL;
+        if (!ec_gen_set_params(gctx, params)) {
+            OPENSSL_free(gctx);
+            gctx = NULL;
+        }
     }
     return gctx;
 }
@@ -1444,7 +1444,7 @@ const OSSL_DISPATCH ossl_ec_keymgmt_functions[] = {
     { OSSL_FUNC_KEYMGMT_QUERY_OPERATION_NAME,
       (void (*)(void))ec_query_operation_name },
     { OSSL_FUNC_KEYMGMT_DUP, (void (*)(void))ec_dup },
-    { 0, NULL }
+    OSSL_DISPATCH_END
 };
 
 #ifndef FIPS_MODULE
@@ -1475,7 +1475,7 @@ const OSSL_DISPATCH ossl_sm2_keymgmt_functions[] = {
     { OSSL_FUNC_KEYMGMT_QUERY_OPERATION_NAME,
       (void (*)(void))sm2_query_operation_name },
     { OSSL_FUNC_KEYMGMT_DUP, (void (*)(void))ec_dup },
-    { 0, NULL }
+    OSSL_DISPATCH_END
 };
 # endif
 #endif

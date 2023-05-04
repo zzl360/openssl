@@ -834,14 +834,17 @@ static int rsa_verify(void *vprsactx, const unsigned char *sig, size_t siglen,
             return 0;
         }
     } else {
+        int ret;
+
         if (!setup_tbuf(prsactx))
             return 0;
-        rslen = RSA_public_decrypt(siglen, sig, prsactx->tbuf, prsactx->rsa,
-                                   prsactx->pad_mode);
-        if (rslen == 0) {
+        ret = RSA_public_decrypt(siglen, sig, prsactx->tbuf, prsactx->rsa,
+                                 prsactx->pad_mode);
+        if (ret <= 0) {
             ERR_raise(ERR_LIB_PROV, ERR_R_RSA_LIB);
             return 0;
         }
+        rslen = (size_t)ret;
     }
 
     if ((rslen != tbslen) || memcmp(tbs, prsactx->tbuf, rslen))
@@ -1485,5 +1488,5 @@ const OSSL_DISPATCH ossl_rsa_signature_functions[] = {
       (void (*)(void))rsa_set_ctx_md_params },
     { OSSL_FUNC_SIGNATURE_SETTABLE_CTX_MD_PARAMS,
       (void (*)(void))rsa_settable_ctx_md_params },
-    { 0, NULL }
+    OSSL_DISPATCH_END
 };

@@ -440,11 +440,24 @@ static BIGNUM *bin2bn(const unsigned char *s, int len, BIGNUM *ret,
     unsigned int n;
     BIGNUM *bn = NULL;
 
+    /* Negative length is not acceptable */
+    if (len < 0)
+        return NULL;
+
     if (ret == NULL)
         ret = bn = BN_new();
     if (ret == NULL)
         return NULL;
     bn_check_top(ret);
+
+    /*
+     * If the input has no bits, the number is considered zero.
+     * This makes calls with s==NULL and len==0 safe.
+     */
+    if (len == 0) {
+        BN_clear(ret);
+        return ret;
+    }
 
     /*
      * The loop that does the work iterates from least to most
@@ -1091,6 +1104,28 @@ void *BN_GENCB_get_arg(BN_GENCB *cb)
 BIGNUM *bn_wexpand(BIGNUM *a, int words)
 {
     return (words <= a->dmax) ? a : bn_expand2(a, words);
+}
+
+void bn_correct_top_consttime(BIGNUM *a)
+{
+    int j, atop;
+    BN_ULONG limb;
+    unsigned int mask;
+
+    for (j = 0, atop = 0; j < a->dmax; j++) {
+        limb = a->d[j];
+        limb |= 0 - limb;
+        limb >>= BN_BITS2 - 1;
+        limb = 0 - limb;
+        mask = (unsigned int)limb;
+        mask &= constant_time_msb(j - a->top);
+        atop = constant_time_select_int(mask, j + 1, atop);
+    }
+
+    mask = constant_time_eq_int(atop, 0);
+    a->top = atop;
+    a->neg = constant_time_select_int(mask, 0, a->neg);
+    a->flags &= ~BN_FLG_FIXED_TOP;
 }
 
 void bn_correct_top(BIGNUM *a)

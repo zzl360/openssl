@@ -153,7 +153,7 @@ static int helper_init(struct helper *h)
     h->have_statm = 1;
 
     h->cc_method = &ossl_cc_dummy_method;
-    if (!TEST_ptr(h->cc_data = h->cc_method->new(NULL, NULL, NULL)))
+    if (!TEST_ptr(h->cc_data = h->cc_method->new(fake_now, NULL)))
         goto err;
 
     if (!TEST_ptr(h->args.ackm = ossl_ackm_new(fake_now, NULL,
@@ -1086,6 +1086,93 @@ static const struct script_op script_14[] = {
     OP_END
 };
 
+/* 15. INITIAL, Anti-Deadlock Probe Simulation */
+static int gen_probe_initial(struct helper *h)
+{
+    OSSL_ACKM_PROBE_INFO *probe = ossl_ackm_get0_probe_request(h->args.ackm);
+
+    /*
+     * Pretend the ACKM asked for an anti-deadlock Initial probe.
+     * We test output of this in the ACKM unit tests.
+     */
+    ++probe->anti_deadlock_initial;
+    return 1;
+}
+
+static const struct script_op script_15[] = {
+    OP_PROVIDE_SECRET(QUIC_ENC_LEVEL_INITIAL, QRL_SUITE_AES128GCM, secret_1)
+    OP_TXP_GENERATE_NONE(TX_PACKETISER_ARCHETYPE_NORMAL)
+    OP_CHECK(gen_probe_initial)
+    OP_TXP_GENERATE(TX_PACKETISER_ARCHETYPE_NORMAL)
+    OP_RX_PKT()
+    OP_EXPECT_DGRAM_LEN(1200, 1200)
+    OP_NEXT_FRAME()
+    OP_EXPECT_FRAME(OSSL_QUIC_FRAME_TYPE_PING)
+    OP_EXPECT_NO_FRAME()
+    OP_RX_PKT_NONE()
+    OP_TXP_GENERATE_NONE(TX_PACKETISER_ARCHETYPE_NORMAL)
+    OP_END
+};
+
+/* 16. HANDSHAKE, Anti-Deadlock Probe Simulation */
+static int gen_probe_handshake(struct helper *h)
+{
+    OSSL_ACKM_PROBE_INFO *probe = ossl_ackm_get0_probe_request(h->args.ackm);
+
+    /*
+     * Pretend the ACKM asked for an anti-deadlock Handshake probe.
+     * We test output of this in the ACKM unit tests.
+     */
+    ++probe->anti_deadlock_handshake;
+    return 1;
+}
+
+static const struct script_op script_16[] = {
+    OP_DISCARD_EL(QUIC_ENC_LEVEL_INITIAL)
+    OP_PROVIDE_SECRET(QUIC_ENC_LEVEL_HANDSHAKE, QRL_SUITE_AES128GCM, secret_1)
+    OP_TXP_GENERATE_NONE(TX_PACKETISER_ARCHETYPE_NORMAL)
+    OP_CHECK(gen_probe_handshake)
+    OP_TXP_GENERATE(TX_PACKETISER_ARCHETYPE_NORMAL)
+    OP_RX_PKT()
+    OP_EXPECT_DGRAM_LEN(21, 512)
+    OP_NEXT_FRAME()
+    OP_EXPECT_FRAME(OSSL_QUIC_FRAME_TYPE_PING)
+    OP_EXPECT_NO_FRAME()
+    OP_RX_PKT_NONE()
+    OP_TXP_GENERATE_NONE(TX_PACKETISER_ARCHETYPE_NORMAL)
+    OP_END
+};
+
+/* 17. 1-RTT, Probe Simulation */
+static int gen_probe_1rtt(struct helper *h)
+{
+    OSSL_ACKM_PROBE_INFO *probe = ossl_ackm_get0_probe_request(h->args.ackm);
+
+    /*
+     * Pretend the ACKM asked for a 1-RTT PTO probe.
+     * We test output of this in the ACKM unit tests.
+     */
+    ++probe->pto[QUIC_PN_SPACE_APP];
+    return 1;
+}
+
+static const struct script_op script_17[] = {
+    OP_DISCARD_EL(QUIC_ENC_LEVEL_INITIAL)
+    OP_DISCARD_EL(QUIC_ENC_LEVEL_HANDSHAKE)
+    OP_PROVIDE_SECRET(QUIC_ENC_LEVEL_1RTT, QRL_SUITE_AES128GCM, secret_1)
+    OP_TXP_GENERATE_NONE(TX_PACKETISER_ARCHETYPE_NORMAL)
+    OP_CHECK(gen_probe_1rtt)
+    OP_TXP_GENERATE(TX_PACKETISER_ARCHETYPE_NORMAL)
+    OP_RX_PKT()
+    OP_EXPECT_DGRAM_LEN(21, 512)
+    OP_NEXT_FRAME()
+    OP_EXPECT_FRAME(OSSL_QUIC_FRAME_TYPE_PING)
+    OP_EXPECT_NO_FRAME()
+    OP_RX_PKT_NONE()
+    OP_TXP_GENERATE_NONE(TX_PACKETISER_ARCHETYPE_NORMAL)
+    OP_END
+};
+
 static const struct script_op *const scripts[] = {
     script_1,
     script_2,
@@ -1100,7 +1187,10 @@ static const struct script_op *const scripts[] = {
     script_11,
     script_12,
     script_13,
-    script_14
+    script_14,
+    script_15,
+    script_16,
+    script_17
 };
 
 static void skip_padding(struct helper *h)
@@ -1116,7 +1206,7 @@ static void skip_padding(struct helper *h)
 
 static int run_script(const struct script_op *script)
 {
-    int testresult = 0, have_helper = 0;
+    int testresult = 0, have_helper = 0, sent_ack_eliciting = 0;
     struct helper h;
     const struct script_op *op;
 
@@ -1127,7 +1217,8 @@ static int run_script(const struct script_op *script)
     for (op = script; op->opcode != OPK_END; ++op) {
         switch (op->opcode) {
         case OPK_TXP_GENERATE:
-            if (!TEST_int_eq(ossl_quic_tx_packetiser_generate(h.txp, (int)op->arg0),
+            if (!TEST_int_eq(ossl_quic_tx_packetiser_generate(h.txp, (int)op->arg0,
+                                                              &sent_ack_eliciting),
                              TX_PACKETISER_RES_SENT_PKT))
                 goto err;
 
@@ -1135,7 +1226,8 @@ static int run_script(const struct script_op *script)
             ossl_qtx_flush_net(h.args.qtx);
             break;
         case OPK_TXP_GENERATE_NONE:
-            if (!TEST_int_eq(ossl_quic_tx_packetiser_generate(h.txp, (int)op->arg0),
+            if (!TEST_int_eq(ossl_quic_tx_packetiser_generate(h.txp, (int)op->arg0,
+                                                              &sent_ack_eliciting),
                              TX_PACKETISER_RES_NO_PKT))
                 goto err;
 

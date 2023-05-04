@@ -14,14 +14,31 @@
 #include "quic_channel_local.h"
 #include <openssl/rand.h>
 
+/*
+ * NOTE: While this channel implementation currently has basic server support,
+ * this functionality has been implemented for internal testing purposes and is
+ * not suitable for network use. In particular, it does not implement address
+ * validation, anti-amplification or retry logic.
+ *
+ * TODO(QUIC): Implement address validation and anti-amplification
+ * TODO(QUIC): Implement retry logic
+ */
+
 #define INIT_DCID_LEN           8
 #define INIT_CRYPTO_BUF_LEN     8192
 #define INIT_APP_BUF_LEN        8192
 
+/*
+ * Interval before we force a PING to ensure NATs don't timeout. This is based
+ * on the lowest commonly seen value of 30 seconds as cited in  RFC 9000 s.
+ * 10.1.2.
+ */
+#define MAX_NAT_INTERVAL (ossl_ms2time(25000))
+
 static void ch_rx_pre(QUIC_CHANNEL *ch);
 static int ch_rx(QUIC_CHANNEL *ch);
 static int ch_tx(QUIC_CHANNEL *ch);
-static void ch_tick(QUIC_TICK_RESULT *res, void *arg);
+static void ch_tick(QUIC_TICK_RESULT *res, void *arg, uint32_t flags);
 static void ch_rx_handle_packet(QUIC_CHANNEL *ch);
 static OSSL_TIME ch_determine_next_tick_deadline(QUIC_CHANNEL *ch);
 static int ch_retry(QUIC_CHANNEL *ch,
@@ -40,8 +57,9 @@ static int ch_on_handshake_yield_secret(uint32_t enc_level, int direction,
                                         const unsigned char *secret,
                                         size_t secret_len,
                                         void *arg);
-static int ch_on_crypto_recv(unsigned char *buf, size_t buf_len,
-                             size_t *bytes_read, void *arg);
+static int ch_on_crypto_recv_record(const unsigned char **buf,
+                                    size_t *bytes_read, void *arg);
+static int ch_on_crypto_release_record(size_t bytes_read, void *arg);
 static int crypto_ensure_empty(QUIC_RSTREAM *rstream);
 static int ch_on_crypto_send(const unsigned char *buf, size_t buf_len,
                              size_t *consumed, void *arg);
@@ -57,11 +75,16 @@ static int ch_discard_el(QUIC_CHANNEL *ch,
                          uint32_t enc_level);
 static void ch_on_idle_timeout(QUIC_CHANNEL *ch);
 static void ch_update_idle(QUIC_CHANNEL *ch);
+static void ch_update_ping_deadline(QUIC_CHANNEL *ch);
 static void ch_raise_net_error(QUIC_CHANNEL *ch);
 static void ch_on_terminating_timeout(QUIC_CHANNEL *ch);
 static void ch_start_terminating(QUIC_CHANNEL *ch,
                                  const QUIC_TERMINATE_CAUSE *tcause,
                                  int force_immediate);
+static void ch_default_packet_handler(QUIC_URXE *e, void *arg);
+static int ch_server_on_new_conn(QUIC_CHANNEL *ch, const BIO_ADDR *peer,
+                                 const QUIC_CONN_ID *peer_scid,
+                                 const QUIC_CONN_ID *peer_dcid);
 
 static int gen_rand_conn_id(OSSL_LIB_CTX *libctx, size_t len, QUIC_CONN_ID *cid)
 {
@@ -87,14 +110,17 @@ static int ch_init(QUIC_CHANNEL *ch)
     OSSL_QUIC_TX_PACKETISER_ARGS txp_args = {0};
     OSSL_QTX_ARGS qtx_args = {0};
     OSSL_QRX_ARGS qrx_args = {0};
-    QUIC_DHS_ARGS dhs_args = {0};
+    QUIC_TLS_ARGS tls_args = {0};
     uint32_t pn_space;
+    size_t rx_short_cid_len = ch->is_server ? INIT_DCID_LEN : 0;
 
-    /* TODO(QUIC): This is only applicable to clients. */
-    if (!gen_rand_conn_id(ch->libctx, INIT_DCID_LEN, &ch->init_dcid))
+    /* For clients, generate our initial DCID. */
+    if (!ch->is_server
+        && !gen_rand_conn_id(ch->libctx, INIT_DCID_LEN, &ch->init_dcid))
         goto err;
 
     /* We plug in a network write BIO to the QTX later when we get one. */
+    qtx_args.libctx = ch->libctx;
     qtx_args.mdpl = QUIC_MIN_INITIAL_DGRAM_LEN;
     ch->rx_max_udp_payload_size = qtx_args.mdpl;
 
@@ -116,18 +142,18 @@ static int ch_init(QUIC_CHANNEL *ch)
     if (!ossl_quic_rxfc_init(&ch->conn_rxfc, NULL,
                              2  * 1024 * 1024,
                              10 * 1024 * 1024,
-                             get_time, NULL))
+                             get_time, ch))
         goto err;
 
     if (!ossl_statm_init(&ch->statm))
         goto err;
 
     ch->have_statm = 1;
-    ch->cc_method = &ossl_cc_dummy_method;
-    if ((ch->cc_data = ch->cc_method->new(NULL, NULL, NULL)) == NULL)
+    ch->cc_method = &ossl_cc_newreno_method;
+    if ((ch->cc_data = ch->cc_method->new(get_time, ch)) == NULL)
         goto err;
 
-    if ((ch->ackm = ossl_ackm_new(get_time, NULL, &ch->statm,
+    if ((ch->ackm = ossl_ackm_new(get_time, ch, &ch->statm,
                                   ch->cc_method, ch->cc_data)) == NULL)
         goto err;
 
@@ -149,6 +175,7 @@ static int ch_init(QUIC_CHANNEL *ch)
     txp_args.cc_method          = ch->cc_method;
     txp_args.cc_data            = ch->cc_data;
     txp_args.now                = get_time;
+    txp_args.now_arg            = ch;
     for (pn_space = QUIC_PN_SPACE_INITIAL; pn_space < QUIC_PN_SPACE_NUM; ++pn_space) {
         ch->crypto_send[pn_space] = ossl_quic_sstream_new(INIT_CRYPTO_BUF_LEN);
         if (ch->crypto_send[pn_space] == NULL)
@@ -161,12 +188,24 @@ static int ch_init(QUIC_CHANNEL *ch)
     if (ch->txp == NULL)
         goto err;
 
-    if ((ch->demux = ossl_quic_demux_new(/*BIO=*/NULL, /*Short CID Len=*/0,
-                                         get_time, NULL)) == NULL)
+    if ((ch->demux = ossl_quic_demux_new(/*BIO=*/NULL,
+                                         /*Short CID Len=*/rx_short_cid_len,
+                                         get_time, ch)) == NULL)
         goto err;
 
+    /*
+     * If we are a server, setup our handler for packets not corresponding to
+     * any known DCID on our end. This is for handling clients establishing new
+     * connections.
+     */
+    if (ch->is_server)
+        ossl_quic_demux_set_default_handler(ch->demux,
+                                            ch_default_packet_handler,
+                                            ch);
+
+    qrx_args.libctx             = ch->libctx;
     qrx_args.demux              = ch->demux;
-    qrx_args.short_conn_id_len  = 0; /* We use a zero-length SCID. */
+    qrx_args.short_conn_id_len  = rx_short_cid_len;
     qrx_args.max_deferred       = 32;
 
     if ((ch->qrx = ossl_qrx_new(&qrx_args)) == NULL)
@@ -177,11 +216,11 @@ static int ch_init(QUIC_CHANNEL *ch)
                                           ch))
         goto err;
 
-    if (!ossl_qrx_add_dst_conn_id(ch->qrx, &txp_args.cur_scid))
+    if (!ch->is_server && !ossl_qrx_add_dst_conn_id(ch->qrx, &txp_args.cur_scid))
         goto err;
 
     for (pn_space = QUIC_PN_SPACE_INITIAL; pn_space < QUIC_PN_SPACE_NUM; ++pn_space) {
-        ch->crypto_recv[pn_space] = ossl_quic_rstream_new(NULL, NULL);
+        ch->crypto_recv[pn_space] = ossl_quic_rstream_new(NULL, NULL, 0);
         if (ch->crypto_recv[pn_space] == NULL)
             goto err;
     }
@@ -194,7 +233,7 @@ static int ch_init(QUIC_CHANNEL *ch)
     if ((ch->stream0->sstream = ossl_quic_sstream_new(INIT_APP_BUF_LEN)) == NULL)
         goto err;
 
-    if ((ch->stream0->rstream = ossl_quic_rstream_new(NULL, NULL)) == NULL)
+    if ((ch->stream0->rstream = ossl_quic_rstream_new(NULL, NULL, 0)) == NULL)
         goto err;
 
     if (!ossl_quic_txfc_init(&ch->stream0->txfc, &ch->conn_txfc))
@@ -203,25 +242,36 @@ static int ch_init(QUIC_CHANNEL *ch)
     if (!ossl_quic_rxfc_init(&ch->stream0->rxfc, &ch->conn_rxfc,
                              1 * 1024 * 1024,
                              5 * 1024 * 1024,
-                             get_time, NULL))
+                             get_time, ch))
         goto err;
 
-    /* Plug in the dummy handshake layer. */
-    dhs_args.crypto_send_cb             = ch_on_crypto_send;
-    dhs_args.crypto_send_cb_arg         = ch;
-    dhs_args.crypto_recv_cb             = ch_on_crypto_recv;
-    dhs_args.crypto_recv_cb_arg         = ch;
-    dhs_args.yield_secret_cb            = ch_on_handshake_yield_secret;
-    dhs_args.yield_secret_cb_arg        = ch;
-    dhs_args.got_transport_params_cb    = ch_on_transport_params;
-    dhs_args.got_transport_params_cb_arg= ch;
-    dhs_args.handshake_complete_cb      = ch_on_handshake_complete;
-    dhs_args.handshake_complete_cb_arg  = ch;
-    dhs_args.alert_cb                   = ch_on_handshake_alert;
-    dhs_args.alert_cb_arg               = ch;
+    /* Plug in the TLS handshake layer. */
+    tls_args.s                          = ch->tls;
+    tls_args.crypto_send_cb             = ch_on_crypto_send;
+    tls_args.crypto_send_cb_arg         = ch;
+    tls_args.crypto_recv_rcd_cb         = ch_on_crypto_recv_record;
+    tls_args.crypto_recv_rcd_cb_arg     = ch;
+    tls_args.crypto_release_rcd_cb      = ch_on_crypto_release_record;
+    tls_args.crypto_release_rcd_cb_arg  = ch;
+    tls_args.yield_secret_cb            = ch_on_handshake_yield_secret;
+    tls_args.yield_secret_cb_arg        = ch;
+    tls_args.got_transport_params_cb    = ch_on_transport_params;
+    tls_args.got_transport_params_cb_arg= ch;
+    tls_args.handshake_complete_cb      = ch_on_handshake_complete;
+    tls_args.handshake_complete_cb_arg  = ch;
+    tls_args.alert_cb                   = ch_on_handshake_alert;
+    tls_args.alert_cb_arg               = ch;
+    tls_args.is_server                  = ch->is_server;
 
-    if ((ch->dhs = ossl_quic_dhs_new(&dhs_args)) == NULL)
+    if ((ch->qtls = ossl_quic_tls_new(&tls_args)) == NULL)
         goto err;
+
+    ch->rx_max_ack_delay        = QUIC_DEFAULT_MAX_ACK_DELAY;
+    ch->rx_ack_delay_exp        = QUIC_DEFAULT_ACK_DELAY_EXP;
+    ch->rx_active_conn_id_limit = QUIC_MIN_ACTIVE_CONN_ID_LIMIT;
+    ch->max_idle_timeout        = QUIC_DEFAULT_IDLE_TIMEOUT;
+    ch->tx_enc_level            = QUIC_ENC_LEVEL_INITIAL;
+    ch->rx_enc_level            = QUIC_ENC_LEVEL_INITIAL;
 
     /*
      * Determine the QUIC Transport Parameters and serialize the transport
@@ -231,12 +281,6 @@ static int ch_init(QUIC_CHANNEL *ch)
     if (!ch->is_server && !ch_generate_transport_params(ch))
         goto err;
 
-    ch->rx_max_ack_delay        = QUIC_DEFAULT_MAX_ACK_DELAY;
-    ch->rx_ack_delay_exp        = QUIC_DEFAULT_ACK_DELAY_EXP;
-    ch->rx_active_conn_id_limit = QUIC_MIN_ACTIVE_CONN_ID_LIMIT;
-    ch->max_idle_timeout        = QUIC_DEFAULT_IDLE_TIMEOUT;
-    ch->tx_enc_level            = QUIC_ENC_LEVEL_INITIAL;
-    ch->rx_enc_level            = QUIC_ENC_LEVEL_INITIAL;
     ch_update_idle(ch);
     ossl_quic_reactor_init(&ch->rtor, ch_tick, ch,
                            ch_determine_next_tick_deadline(ch));
@@ -283,7 +327,7 @@ static void ch_cleanup(QUIC_CHANNEL *ch)
     ossl_qrx_pkt_release(ch->qrx_pkt);
     ch->qrx_pkt = NULL;
 
-    ossl_quic_dhs_free(ch->dhs);
+    ossl_quic_tls_free(ch->qtls);
     ossl_qrx_free(ch->qrx);
     ossl_quic_demux_free(ch->demux);
     OPENSSL_free(ch->local_transport_params);
@@ -299,6 +343,10 @@ QUIC_CHANNEL *ossl_quic_channel_new(const QUIC_CHANNEL_ARGS *args)
     ch->libctx      = args->libctx;
     ch->propq       = args->propq;
     ch->is_server   = args->is_server;
+    ch->tls         = args->tls;
+    ch->mutex       = args->mutex;
+    ch->now_cb      = args->now_cb;
+    ch->now_cb_arg  = args->now_cb_arg;
 
     if (!ch_init(ch)) {
         OPENSSL_free(ch);
@@ -315,6 +363,19 @@ void ossl_quic_channel_free(QUIC_CHANNEL *ch)
 
     ch_cleanup(ch);
     OPENSSL_free(ch);
+}
+
+/* Set mutator callbacks for test framework support */
+int ossl_quic_channel_set_mutator(QUIC_CHANNEL *ch,
+                                  ossl_mutate_packet_cb mutatecb,
+                                  ossl_finish_mutate_cb finishmutatecb,
+                                  void *mutatearg)
+{
+    if (ch->qtx == NULL)
+        return 0;
+
+    ossl_qtx_set_mutator(ch->qtx, mutatecb, finishmutatecb, mutatearg);
+    return 1;
 }
 
 int ossl_quic_channel_get_peer_addr(QUIC_CHANNEL *ch, BIO_ADDR *peer_addr)
@@ -357,13 +418,19 @@ int ossl_quic_channel_is_active(const QUIC_CHANNEL *ch)
 
 int ossl_quic_channel_is_terminating(const QUIC_CHANNEL *ch)
 {
-    return ch->state == QUIC_CHANNEL_STATE_TERMINATING_CLOSING
-        || ch->state == QUIC_CHANNEL_STATE_TERMINATING_DRAINING;
+    if (ch->state == QUIC_CHANNEL_STATE_TERMINATING_CLOSING
+            || ch->state == QUIC_CHANNEL_STATE_TERMINATING_DRAINING)
+        return 1;
+
+    return 0;
 }
 
 int ossl_quic_channel_is_terminated(const QUIC_CHANNEL *ch)
 {
-    return ch->state == QUIC_CHANNEL_STATE_TERMINATED;
+    if (ch->state == QUIC_CHANNEL_STATE_TERMINATED)
+        return 1;
+
+    return 0;
 }
 
 int ossl_quic_channel_is_term_any(const QUIC_CHANNEL *ch)
@@ -372,9 +439,29 @@ int ossl_quic_channel_is_term_any(const QUIC_CHANNEL *ch)
         || ossl_quic_channel_is_terminated(ch);
 }
 
+QUIC_TERMINATE_CAUSE ossl_quic_channel_get_terminate_cause(const QUIC_CHANNEL *ch)
+{
+    return ch->terminate_cause;
+}
+
 int ossl_quic_channel_is_handshake_complete(const QUIC_CHANNEL *ch)
 {
     return ch->handshake_complete;
+}
+
+int ossl_quic_channel_is_handshake_confirmed(const QUIC_CHANNEL *ch)
+{
+    return ch->handshake_confirmed;
+}
+
+QUIC_DEMUX *ossl_quic_channel_get0_demux(QUIC_CHANNEL *ch)
+{
+    return ch->demux;
+}
+
+CRYPTO_MUTEX *ossl_quic_channel_get_mutex(QUIC_CHANNEL *ch)
+{
+    return ch->mutex;
 }
 
 /*
@@ -385,7 +472,12 @@ int ossl_quic_channel_is_handshake_complete(const QUIC_CHANNEL *ch)
 /* Used by various components. */
 static OSSL_TIME get_time(void *arg)
 {
-    return ossl_time_now();
+    QUIC_CHANNEL *ch = arg;
+
+    if (ch->now_cb == NULL)
+        return ossl_time_now();
+
+    return ch->now_cb(ch->now_cb_arg);
 }
 
 /* Used by QSM. */
@@ -445,8 +537,8 @@ static int crypto_ensure_empty(QUIC_RSTREAM *rstream)
     return avail == 0;
 }
 
-static int ch_on_crypto_recv(unsigned char *buf, size_t buf_len,
-                             size_t *bytes_read, void *arg)
+static int ch_on_crypto_recv_record(const unsigned char **buf,
+                                    size_t *bytes_read, void *arg)
 {
     QUIC_CHANNEL *ch = arg;
     QUIC_RSTREAM *rstream;
@@ -480,8 +572,20 @@ static int ch_on_crypto_recv(unsigned char *buf, size_t buf_len,
     if (rstream == NULL)
         return 0;
 
-    return ossl_quic_rstream_read(rstream, buf, buf_len, bytes_read,
-                                  &is_fin);
+    return ossl_quic_rstream_get_record(rstream, buf, bytes_read,
+                                        &is_fin);
+}
+
+static int ch_on_crypto_release_record(size_t bytes_read, void *arg)
+{
+    QUIC_CHANNEL *ch = arg;
+    QUIC_RSTREAM *rstream;
+
+    rstream = ch->crypto_recv[ossl_quic_enc_level_to_pn_space(ch->rx_enc_level)];
+    if (rstream == NULL)
+        return 0;
+
+    return ossl_quic_rstream_release_record(rstream, bytes_read);
 }
 
 static int ch_on_handshake_yield_secret(uint32_t enc_level, int direction,
@@ -557,12 +661,16 @@ static int ch_on_handshake_complete(void *arg)
     if (!ossl_assert(ch->tx_enc_level == QUIC_ENC_LEVEL_1RTT))
         return 0;
 
-    if (!ch->got_remote_transport_params)
+    if (!ch->got_remote_transport_params) {
         /*
          * Was not a valid QUIC handshake if we did not get valid transport
          * params.
          */
+        ossl_quic_channel_raise_protocol_error(ch, QUIC_ERR_PROTOCOL_VIOLATION,
+                                               OSSL_QUIC_FRAME_TYPE_CRYPTO,
+                                               "no transport parameters received");
         return 0;
+    }
 
     /* Don't need transport parameters anymore. */
     OPENSSL_free(ch->local_transport_params);
@@ -572,6 +680,16 @@ static int ch_on_handshake_complete(void *arg)
     ossl_quic_tx_packetiser_notify_handshake_complete(ch->txp);
 
     ch->handshake_complete = 1;
+
+    if (ch->is_server) {
+        /*
+         * On the server, the handshake is confirmed as soon as it is complete.
+         */
+        ossl_quic_channel_on_handshake_confirmed(ch);
+
+        ossl_quic_tx_packetiser_schedule_handshake_done(ch->txp);
+    }
+
     return 1;
 }
 
@@ -594,6 +712,19 @@ static int ch_on_handshake_alert(void *arg, unsigned char alert_code)
  * peer. Note that these are not authenticated until the handshake is marked
  * as complete.
  */
+#define TP_REASON_SERVER_ONLY(x) \
+    x " may not be sent by a client"
+#define TP_REASON_DUP(x) \
+    x " appears multiple times"
+#define TP_REASON_MALFORMED(x) \
+    x " is malformed"
+#define TP_REASON_EXPECTED_VALUE(x) \
+    x " does not match expected value"
+#define TP_REASON_NOT_RETRY(x) \
+    x " sent when not performing a retry"
+#define TP_REASON_REQUIRED(x) \
+    x " was not sent but is required"
+
 static int ch_on_transport_params(const unsigned char *params,
                                   size_t params_len,
                                   void *arg)
@@ -618,6 +749,7 @@ static int ch_on_transport_params(const unsigned char *params,
     int got_max_idle_timeout = 0;
     int got_active_conn_id_limit = 0;
     QUIC_CONN_ID cid;
+    const char *reason = "bad transport parameter";
 
     if (ch->got_remote_transport_params)
         goto malformed;
@@ -631,69 +763,108 @@ static int ch_on_transport_params(const unsigned char *params,
 
         switch (id) {
         case QUIC_TPARAM_ORIG_DCID:
-            if (got_orig_dcid)
-                /* must not appear more than once */
+            if (got_orig_dcid) {
+                reason = TP_REASON_DUP("ORIG_DCID");
                 goto malformed;
+            }
 
-            if (!ossl_quic_wire_decode_transport_param_cid(&pkt, NULL, &cid))
+            if (ch->is_server) {
+                reason = TP_REASON_SERVER_ONLY("ORIG_DCID");
                 goto malformed;
+            }
+
+            if (!ossl_quic_wire_decode_transport_param_cid(&pkt, NULL, &cid)) {
+                reason = TP_REASON_MALFORMED("ORIG_DCID");
+                goto malformed;
+            }
 
             /* Must match our initial DCID. */
-            if (!ossl_quic_conn_id_eq(&ch->init_dcid, &cid))
+            if (!ossl_quic_conn_id_eq(&ch->init_dcid, &cid)) {
+                reason = TP_REASON_EXPECTED_VALUE("ORIG_DCID");
                 goto malformed;
+            }
 
             got_orig_dcid = 1;
             break;
 
         case QUIC_TPARAM_RETRY_SCID:
-            if (got_retry_scid || !ch->doing_retry)
-                /* must not appear more than once or if retry not done */
+            if (ch->is_server) {
+                reason = TP_REASON_SERVER_ONLY("RETRY_SCID");
                 goto malformed;
+            }
 
-            if (!ossl_quic_wire_decode_transport_param_cid(&pkt, NULL, &cid))
+            if (got_retry_scid) {
+                reason = TP_REASON_DUP("RETRY_SCID");
                 goto malformed;
+            }
+
+            if (!ch->doing_retry) {
+                reason = TP_REASON_NOT_RETRY("RETRY_SCID");
+                goto malformed;
+            }
+
+            if (!ossl_quic_wire_decode_transport_param_cid(&pkt, NULL, &cid)) {
+                reason = TP_REASON_MALFORMED("RETRY_SCID");
+                goto malformed;
+            }
 
             /* Must match Retry packet SCID. */
-            if (!ossl_quic_conn_id_eq(&ch->retry_scid, &cid))
+            if (!ossl_quic_conn_id_eq(&ch->retry_scid, &cid)) {
+                reason = TP_REASON_EXPECTED_VALUE("RETRY_SCID");
                 goto malformed;
+            }
 
             got_retry_scid = 1;
             break;
 
         case QUIC_TPARAM_INITIAL_SCID:
-            if (got_initial_scid)
+            if (got_initial_scid) {
                 /* must not appear more than once */
+                reason = TP_REASON_DUP("INITIAL_SCID");
                 goto malformed;
+            }
 
-            if (!ossl_quic_wire_decode_transport_param_cid(&pkt, NULL, &cid))
+            if (!ossl_quic_wire_decode_transport_param_cid(&pkt, NULL, &cid)) {
+                reason = TP_REASON_MALFORMED("INITIAL_SCID");
                 goto malformed;
+            }
 
             /* Must match SCID of first Initial packet from server. */
-            if (!ossl_quic_conn_id_eq(&ch->init_scid, &cid))
+            if (!ossl_quic_conn_id_eq(&ch->init_scid, &cid)) {
+                reason = TP_REASON_EXPECTED_VALUE("INITIAL_SCID");
                 goto malformed;
+            }
 
             got_initial_scid = 1;
             break;
 
         case QUIC_TPARAM_INITIAL_MAX_DATA:
-            if (got_initial_max_data)
+            if (got_initial_max_data) {
                 /* must not appear more than once */
+                reason = TP_REASON_DUP("INITIAL_MAX_DATA");
                 goto malformed;
+            }
 
-            if (!ossl_quic_wire_decode_transport_param_int(&pkt, &id, &v))
+            if (!ossl_quic_wire_decode_transport_param_int(&pkt, &id, &v)) {
+                reason = TP_REASON_MALFORMED("INITIAL_MAX_DATA");
                 goto malformed;
+            }
 
             ossl_quic_txfc_bump_cwm(&ch->conn_txfc, v);
             got_initial_max_data = 1;
             break;
 
         case QUIC_TPARAM_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL:
-            if (got_initial_max_stream_data_bidi_local)
+            if (got_initial_max_stream_data_bidi_local) {
                 /* must not appear more than once */
+                reason = TP_REASON_DUP("INITIAL_MAX_STREAM_DATA_BIDI_LOCAL");
                 goto malformed;
+            }
 
-            if (!ossl_quic_wire_decode_transport_param_int(&pkt, &id, &v))
+            if (!ossl_quic_wire_decode_transport_param_int(&pkt, &id, &v)) {
+                reason = TP_REASON_MALFORMED("INITIAL_MAX_STREAM_DATA_BIDI_LOCAL");
                 goto malformed;
+            }
 
             /*
              * This is correct; the BIDI_LOCAL TP governs streams created by
@@ -704,12 +875,16 @@ static int ch_on_transport_params(const unsigned char *params,
             break;
 
         case QUIC_TPARAM_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE:
-            if (got_initial_max_stream_data_bidi_remote)
+            if (got_initial_max_stream_data_bidi_remote) {
                 /* must not appear more than once */
+                reason = TP_REASON_DUP("INITIAL_MAX_STREAM_DATA_BIDI_REMOTE");
                 goto malformed;
+            }
 
-            if (!ossl_quic_wire_decode_transport_param_int(&pkt, &id, &v))
+            if (!ossl_quic_wire_decode_transport_param_int(&pkt, &id, &v)) {
+                reason = TP_REASON_MALFORMED("INITIAL_MAX_STREAM_DATA_BIDI_REMOTE");
                 goto malformed;
+            }
 
             /*
              * This is correct; the BIDI_REMOTE TP governs streams created
@@ -723,51 +898,67 @@ static int ch_on_transport_params(const unsigned char *params,
             break;
 
         case QUIC_TPARAM_INITIAL_MAX_STREAM_DATA_UNI:
-            if (got_initial_max_stream_data_uni)
+            if (got_initial_max_stream_data_uni) {
                 /* must not appear more than once */
+                reason = TP_REASON_DUP("INITIAL_MAX_STREAM_DATA_UNI");
                 goto malformed;
+            }
 
-            if (!ossl_quic_wire_decode_transport_param_int(&pkt, &id, &v))
+            if (!ossl_quic_wire_decode_transport_param_int(&pkt, &id, &v)) {
+                reason = TP_REASON_MALFORMED("INITIAL_MAX_STREAM_DATA_UNI");
                 goto malformed;
+            }
 
             ch->init_max_stream_data_uni_remote = v;
             got_initial_max_stream_data_uni = 1;
             break;
 
         case QUIC_TPARAM_ACK_DELAY_EXP:
-            if (got_ack_delay_exp)
+            if (got_ack_delay_exp) {
                 /* must not appear more than once */
+                reason = TP_REASON_DUP("ACK_DELAY_EXP");
                 goto malformed;
+            }
 
             if (!ossl_quic_wire_decode_transport_param_int(&pkt, &id, &v)
-                || v > QUIC_MAX_ACK_DELAY_EXP)
+                || v > QUIC_MAX_ACK_DELAY_EXP) {
+                reason = TP_REASON_MALFORMED("ACK_DELAY_EXP");
                 goto malformed;
+            }
 
             ch->rx_ack_delay_exp = (unsigned char)v;
             got_ack_delay_exp = 1;
             break;
 
         case QUIC_TPARAM_MAX_ACK_DELAY:
-            if (got_max_ack_delay)
+            if (got_max_ack_delay) {
                 /* must not appear more than once */
+                reason = TP_REASON_DUP("MAX_ACK_DELAY");
                 return 0;
+            }
 
             if (!ossl_quic_wire_decode_transport_param_int(&pkt, &id, &v)
-                || v >= (((uint64_t)1) << 14))
+                || v >= (((uint64_t)1) << 14)) {
+                reason = TP_REASON_MALFORMED("MAX_ACK_DELAY");
                 goto malformed;
+            }
 
             ch->rx_max_ack_delay = v;
             got_max_ack_delay = 1;
             break;
 
         case QUIC_TPARAM_INITIAL_MAX_STREAMS_BIDI:
-            if (got_initial_max_streams_bidi)
+            if (got_initial_max_streams_bidi) {
                 /* must not appear more than once */
+                reason = TP_REASON_DUP("INITIAL_MAX_STREAMS_BIDI");
                 return 0;
+            }
 
             if (!ossl_quic_wire_decode_transport_param_int(&pkt, &id, &v)
-                || v > (((uint64_t)1) << 60))
+                || v > (((uint64_t)1) << 60)) {
+                reason = TP_REASON_MALFORMED("INITIAL_MAX_STREAMS_BIDI");
                 goto malformed;
+            }
 
             assert(ch->max_local_streams_bidi == 0);
             ch->max_local_streams_bidi = v;
@@ -775,13 +966,17 @@ static int ch_on_transport_params(const unsigned char *params,
             break;
 
         case QUIC_TPARAM_INITIAL_MAX_STREAMS_UNI:
-            if (got_initial_max_streams_uni)
+            if (got_initial_max_streams_uni) {
                 /* must not appear more than once */
+                reason = TP_REASON_DUP("INITIAL_MAX_STREAMS_UNI");
                 goto malformed;
+            }
 
             if (!ossl_quic_wire_decode_transport_param_int(&pkt, &id, &v)
-                || v > (((uint64_t)1) << 60))
+                || v > (((uint64_t)1) << 60)) {
+                reason = TP_REASON_MALFORMED("INITIAL_MAX_STREAMS_UNI");
                 goto malformed;
+            }
 
             assert(ch->max_local_streams_uni == 0);
             ch->max_local_streams_uni = v;
@@ -789,14 +984,18 @@ static int ch_on_transport_params(const unsigned char *params,
             break;
 
         case QUIC_TPARAM_MAX_IDLE_TIMEOUT:
-            if (got_max_idle_timeout)
+            if (got_max_idle_timeout) {
                 /* must not appear more than once */
+                reason = TP_REASON_DUP("MAX_IDLE_TIMEOUT");
                 goto malformed;
+            }
 
-            if (!ossl_quic_wire_decode_transport_param_int(&pkt, &id, &v))
+            if (!ossl_quic_wire_decode_transport_param_int(&pkt, &id, &v)) {
+                reason = TP_REASON_MALFORMED("MAX_IDLE_TIMEOUT");
                 goto malformed;
+            }
 
-            if (v < ch->max_idle_timeout)
+            if (v > 0 && v < ch->max_idle_timeout)
                 ch->max_idle_timeout = v;
 
             ch_update_idle(ch);
@@ -804,36 +1003,72 @@ static int ch_on_transport_params(const unsigned char *params,
             break;
 
         case QUIC_TPARAM_MAX_UDP_PAYLOAD_SIZE:
-            if (got_max_udp_payload_size)
+            if (got_max_udp_payload_size) {
                 /* must not appear more than once */
+                reason = TP_REASON_DUP("MAX_UDP_PAYLOAD_SIZE");
                 goto malformed;
+            }
 
             if (!ossl_quic_wire_decode_transport_param_int(&pkt, &id, &v)
-                || v < QUIC_MIN_INITIAL_DGRAM_LEN)
+                || v < QUIC_MIN_INITIAL_DGRAM_LEN) {
+                reason = TP_REASON_MALFORMED("MAX_UDP_PAYLOAD_SIZE");
                 goto malformed;
+            }
 
             ch->rx_max_udp_payload_size = v;
             got_max_udp_payload_size    = 1;
             break;
 
         case QUIC_TPARAM_ACTIVE_CONN_ID_LIMIT:
-            if (got_active_conn_id_limit)
+            if (got_active_conn_id_limit) {
                 /* must not appear more than once */
+                reason = TP_REASON_DUP("ACTIVE_CONN_ID_LIMIT");
                 goto malformed;
+            }
 
             if (!ossl_quic_wire_decode_transport_param_int(&pkt, &id, &v)
-                || v < QUIC_MIN_ACTIVE_CONN_ID_LIMIT)
+                || v < QUIC_MIN_ACTIVE_CONN_ID_LIMIT) {
+                reason = TP_REASON_MALFORMED("ACTIVE_CONN_ID_LIMIT");
                 goto malformed;
+            }
 
             ch->rx_active_conn_id_limit = v;
             got_active_conn_id_limit = 1;
             break;
 
-        /*
-         * TODO(QUIC): Handle:
-         *   QUIC_TPARAM_STATELESS_RESET_TOKEN
-         *   QUIC_TPARAM_PREFERRED_ADDR
-         */
+        case QUIC_TPARAM_STATELESS_RESET_TOKEN:
+            /* TODO(QUIC): Handle stateless reset tokens. */
+            /*
+             * We ignore these for now, but we must ensure a client doesn't
+             * send them.
+             */
+            if (ch->is_server) {
+                reason = TP_REASON_SERVER_ONLY("STATELESS_RESET_TOKEN");
+                goto malformed;
+            }
+
+            body = ossl_quic_wire_decode_transport_param_bytes(&pkt, &id, &len);
+            if (body == NULL || len != QUIC_STATELESS_RESET_TOKEN_LEN) {
+                reason = TP_REASON_MALFORMED("STATELESS_RESET_TOKEN");
+                goto malformed;
+            }
+
+            break;
+
+        case QUIC_TPARAM_PREFERRED_ADDR:
+            /* TODO(QUIC): Handle preferred address. */
+            if (ch->is_server) {
+                reason = TP_REASON_SERVER_ONLY("PREFERRED_ADDR");
+                goto malformed;
+            }
+
+            body = ossl_quic_wire_decode_transport_param_bytes(&pkt, &id, &len);
+            if (body == NULL) {
+                reason = TP_REASON_MALFORMED("PREFERRED_ADDR");
+                goto malformed;
+            }
+
+            break;
 
         case QUIC_TPARAM_DISABLE_ACTIVE_MIGRATION:
             /* We do not currently handle migration, so nothing to do. */
@@ -848,9 +1083,22 @@ static int ch_on_transport_params(const unsigned char *params,
         }
     }
 
-    if (!got_orig_dcid || !got_initial_scid || got_retry_scid != ch->doing_retry)
-        /* Transport parameters were not valid. */
+    if (!got_initial_scid) {
+        reason = TP_REASON_REQUIRED("INITIAL_SCID");
         goto malformed;
+    }
+
+    if (!ch->is_server) {
+        if (!got_orig_dcid) {
+            reason = TP_REASON_REQUIRED("ORIG_DCID");
+            goto malformed;
+        }
+
+        if (ch->doing_retry && !got_retry_scid) {
+            reason = TP_REASON_REQUIRED("RETRY_SCID");
+            goto malformed;
+        }
+    }
 
     ch->got_remote_transport_params = 1;
 
@@ -870,7 +1118,7 @@ static int ch_on_transport_params(const unsigned char *params,
 
 malformed:
     ossl_quic_channel_raise_protocol_error(ch, QUIC_ERR_TRANSPORT_PARAMETER_ERROR,
-                                           0, "bad transport parameter");
+                                           0, reason);
     return 0;
 }
 
@@ -902,9 +1150,20 @@ static int ch_generate_transport_params(QUIC_CHANNEL *ch)
                                                     NULL, 0) == NULL)
         goto err;
 
-    if (ossl_quic_wire_encode_transport_param_bytes(&wpkt, QUIC_TPARAM_INITIAL_SCID,
-                                                    NULL, 0) == NULL)
-        goto err;
+    if (ch->is_server) {
+        if (!ossl_quic_wire_encode_transport_param_cid(&wpkt, QUIC_TPARAM_ORIG_DCID,
+                                                       &ch->init_dcid))
+            goto err;
+
+        if (!ossl_quic_wire_encode_transport_param_cid(&wpkt, QUIC_TPARAM_INITIAL_SCID,
+                                                       &ch->cur_local_dcid))
+            goto err;
+    } else {
+        /* Client always uses an empty SCID. */
+        if (ossl_quic_wire_encode_transport_param_bytes(&wpkt, QUIC_TPARAM_INITIAL_SCID,
+                                                        NULL, 0) == NULL)
+            goto err;
+    }
 
     if (!ossl_quic_wire_encode_transport_param_int(&wpkt, QUIC_TPARAM_MAX_IDLE_TIMEOUT,
                                                    ch->max_idle_timeout))
@@ -940,7 +1199,7 @@ static int ch_generate_transport_params(QUIC_CHANNEL *ch)
         goto err;
 
     if (!ossl_quic_wire_encode_transport_param_int(&wpkt, QUIC_TPARAM_INITIAL_MAX_STREAMS_BIDI,
-                                                   0))
+                                                   ch->is_server ? 1 : 0))
         goto err;
 
     if (!ossl_quic_wire_encode_transport_param_int(&wpkt, QUIC_TPARAM_INITIAL_MAX_STREAMS_UNI,
@@ -958,7 +1217,7 @@ static int ch_generate_transport_params(QUIC_CHANNEL *ch)
 
     wpkt_valid = 0;
 
-    if (!ossl_quic_dhs_set_transport_params(ch->dhs, ch->local_transport_params,
+    if (!ossl_quic_tls_set_transport_params(ch->qtls, ch->local_transport_params,
                                             buf_len))
         goto err;
 
@@ -980,10 +1239,11 @@ err:
  * at least everything network I/O related. Best effort - not allowed to fail
  * "loudly".
  */
-static void ch_tick(QUIC_TICK_RESULT *res, void *arg)
+static void ch_tick(QUIC_TICK_RESULT *res, void *arg, uint32_t flags)
 {
     OSSL_TIME now, deadline;
     QUIC_CHANNEL *ch = arg;
+    int channel_only = (flags & QUIC_REACTOR_TICK_FLAG_CHANNEL_ONLY) != 0;
 
     /*
      * When we tick the QUIC connection, we do everything we need to do
@@ -1009,7 +1269,7 @@ static void ch_tick(QUIC_TICK_RESULT *res, void *arg)
      * expired.
      */
     if (ossl_quic_channel_is_terminating(ch)) {
-        now = ossl_time_now();
+        now = get_time(ch);
 
         if (ossl_time_compare(now, ch->terminate_deadline) >= 0) {
             ch_on_terminating_timeout(ch);
@@ -1032,7 +1292,8 @@ static void ch_tick(QUIC_TICK_RESULT *res, void *arg)
          * new outgoing data.
          */
         ch->have_new_rx_secret = 0;
-        ossl_quic_dhs_tick(ch->dhs);
+        if (!channel_only)
+            ossl_quic_tls_tick(ch->qtls);
 
         /*
          * If the handshake layer gave us a new secret, we need to do RX again
@@ -1050,7 +1311,7 @@ static void ch_tick(QUIC_TICK_RESULT *res, void *arg)
      * ACKM ACK generation deadline is polled by TXP, so we don't need to handle
      * it here.
      */
-    now = ossl_time_now();
+    now = get_time(ch);
     if (ossl_time_compare(now, ch->idle_deadline) >= 0) {
         /*
          * Idle timeout differs from normal protocol violation because we do not
@@ -1066,6 +1327,13 @@ static void ch_tick(QUIC_TICK_RESULT *res, void *arg)
     deadline = ossl_ackm_get_loss_detection_deadline(ch->ackm);
     if (!ossl_time_is_zero(deadline) && ossl_time_compare(now, deadline) >= 0)
         ossl_ackm_on_timeout(ch->ackm);
+
+    /* If a ping is due, inform TXP. */
+    if (ossl_time_compare(now, ch->ping_deadline) >= 0) {
+        int pn_space = ossl_quic_enc_level_to_pn_space(ch->tx_enc_level);
+
+        ossl_quic_tx_packetiser_schedule_ack_eliciting(ch->txp, pn_space);
+    }
 
     /* Write any data to the network due to be sent. */
     ch_tx(ch);
@@ -1092,7 +1360,7 @@ static void ch_rx_pre(QUIC_CHANNEL *ch)
 {
     int ret;
 
-    if (!ch->have_sent_any_pkt)
+    if (!ch->is_server && !ch->have_sent_any_pkt)
         return;
 
     /*
@@ -1116,12 +1384,10 @@ static int ch_rx(QUIC_CHANNEL *ch)
 {
     int handled_any = 0;
 
-    if (!ch->have_sent_any_pkt)
+    if (!ch->is_server && !ch->have_sent_any_pkt)
         /*
          * We have not sent anything yet, therefore there is no need to check
          * for incoming data.
-         *
-         * TODO(QUIC): Needs revising when server support added.
          */
         return 1;
 
@@ -1144,6 +1410,7 @@ static int ch_rx(QUIC_CHANNEL *ch)
         ossl_qrx_pkt_release(ch->qrx_pkt);
         ch->qrx_pkt = NULL;
 
+        ch->have_sent_ack_eliciting_since_rx = 0;
         handled_any = 1;
     }
 
@@ -1185,14 +1452,12 @@ static void ch_rx_handle_packet(QUIC_CHANNEL *ch)
     /* Handle incoming packet. */
     switch (ch->qrx_pkt->hdr->type) {
     case QUIC_PKT_TYPE_RETRY:
-        if (ch->doing_retry)
+        if (ch->doing_retry || ch->is_server)
             /*
              * It is not allowed to ask a client to do a retry more than
-             * once.
+             * once. Clients may not send retries.
              */
             return;
-
-        /* TODO(QUIC): handle server mode */
 
         if (ch->qrx_pkt->hdr->len <= QUIC_RETRY_INTEGRITY_TAG_LEN)
             /* Packets with zero-length Retry Tokens are invalid. */
@@ -1219,16 +1484,21 @@ static void ch_rx_handle_packet(QUIC_CHANNEL *ch)
                  &ch->qrx_pkt->hdr->src_conn_id);
         break;
 
-    case QUIC_PKT_TYPE_VERSION_NEG:
-        /* TODO(QUIC): Implement version negotiation */
-        break;
-
     case QUIC_PKT_TYPE_0RTT:
-        /* TODO(QQUIC): handle if server */
-        /* Clients should never receive 0-RTT packets */
+        if (!ch->is_server)
+            /* Clients should never receive 0-RTT packets. */
+            return;
+
+        /*
+         * TODO(QUIC): Implement 0-RTT on the server side. We currently do
+         * not need to implement this as a client can only do 0-RTT if we
+         * have given it permission to in a previous session.
+         */
         break;
 
-    default:
+    case QUIC_PKT_TYPE_INITIAL:
+    case QUIC_PKT_TYPE_HANDSHAKE:
+    case QUIC_PKT_TYPE_1RTT:
         if (ch->qrx_pkt->hdr->type == QUIC_PKT_TYPE_HANDSHAKE)
             /*
              * We automatically drop INITIAL EL keys when first successfully
@@ -1239,12 +1509,99 @@ static void ch_rx_handle_packet(QUIC_CHANNEL *ch)
         /* This packet contains frames, pass to the RXDP. */
         ossl_quic_handle_frames(ch, ch->qrx_pkt); /* best effort */
         break;
+
+    default:
+        assert(0);
+        break;
     }
+}
+
+/*
+ * This is called by the demux when we get a packet not destined for any known
+ * DCID.
+ */
+static void ch_default_packet_handler(QUIC_URXE *e, void *arg)
+{
+    QUIC_CHANNEL *ch = arg;
+    PACKET pkt;
+    QUIC_PKT_HDR hdr;
+
+    if (!ossl_assert(ch->is_server))
+        goto undesirable;
+
+    /*
+     * We only support one connection to our server currently, so if we already
+     * started one, ignore any new connection attempts.
+     */
+    if (ch->state != QUIC_CHANNEL_STATE_IDLE)
+        goto undesirable;
+
+    /*
+     * We have got a packet for an unknown DCID. This might be an attempt to
+     * open a new connection.
+     */
+    if (e->data_len < QUIC_MIN_INITIAL_DGRAM_LEN)
+        goto undesirable;
+
+    if (!PACKET_buf_init(&pkt, ossl_quic_urxe_data(e), e->data_len))
+        goto err;
+
+    /*
+     * We set short_conn_id_len to SIZE_MAX here which will cause the decode
+     * operation to fail if we get a 1-RTT packet. This is fine since we only
+     * care about Initial packets.
+     */
+    if (!ossl_quic_wire_decode_pkt_hdr(&pkt, SIZE_MAX, 1, &hdr, NULL))
+        goto undesirable;
+
+    switch (hdr.version) {
+        case QUIC_VERSION_1:
+            break;
+
+        case QUIC_VERSION_NONE:
+        default:
+            /* Unknown version or proactive version negotiation request, bail. */
+            /* TODO(QUIC): Handle version negotiation on server side */
+            goto undesirable;
+    }
+
+    /*
+     * We only care about Initial packets which might be trying to establish a
+     * connection.
+     */
+    if (hdr.type != QUIC_PKT_TYPE_INITIAL)
+        goto undesirable;
+
+    /*
+     * Assume this is a valid attempt to initiate a connection.
+     *
+     * We do not register the DCID in the initial packet we received and that
+     * DCID is not actually used again, thus after provisioning the correct
+     * Initial keys derived from it (which is done in the call below) we pass
+     * the received packet directly to the QRX so that it can process it as a
+     * one-time thing, instead of going through the usual DEMUX DCID-based
+     * routing.
+     */
+    if (!ch_server_on_new_conn(ch, &e->peer,
+                               &hdr.src_conn_id,
+                               &hdr.dst_conn_id))
+        goto err;
+
+    ossl_qrx_inject_urxe(ch->qrx, e);
+    return;
+
+err:
+    ossl_quic_channel_raise_protocol_error(ch, QUIC_ERR_INTERNAL_ERROR, 0,
+                                           "internal error");
+undesirable:
+    ossl_quic_demux_release_urxe(ch->demux, e);
 }
 
 /* Try to generate packets and if possible, flush them to the network. */
 static int ch_tx(QUIC_CHANNEL *ch)
 {
+    int sent_ack_eliciting = 0;
+
     if (ch->state == QUIC_CHANNEL_STATE_TERMINATING_CLOSING) {
         /*
          * While closing, only send CONN_CLOSE if we've received more traffic
@@ -1266,10 +1623,24 @@ static int ch_tx(QUIC_CHANNEL *ch)
      * flush any queued packets which we already generated.
      */
     switch (ossl_quic_tx_packetiser_generate(ch->txp,
-                                             TX_PACKETISER_ARCHETYPE_NORMAL)) {
+                                             TX_PACKETISER_ARCHETYPE_NORMAL,
+                                             &sent_ack_eliciting)) {
     case TX_PACKETISER_RES_SENT_PKT:
         ch->have_sent_any_pkt = 1; /* Packet was sent */
+
+        /*
+         * RFC 9000 s. 10.1. 'An endpoint also restarts its idle timer when
+         * sending an ack-eliciting packet if no other ack-eliciting packets
+         * have been sent since last receiving and processing a packet.'
+         */
+        if (sent_ack_eliciting && !ch->have_sent_ack_eliciting_since_rx) {
+            ch_update_idle(ch);
+            ch->have_sent_ack_eliciting_since_rx = 1;
+        }
+
+        ch_update_ping_deadline(ch);
         break;
+
     case TX_PACKETISER_RES_NO_PKT:
         break; /* No packet was sent */
     default:
@@ -1316,7 +1687,7 @@ static OSSL_TIME ch_determine_next_tick_deadline(QUIC_CHANNEL *ch)
     if (ossl_quic_tx_packetiser_has_pending(ch->txp, TX_PACKETISER_ARCHETYPE_NORMAL,
                                             TX_PACKETISER_BYPASS_CC))
         deadline = ossl_time_min(deadline,
-                                 ch->cc_method->get_next_credit_time(ch->cc_data));
+                                 ch->cc_method->get_wakeup_deadline(ch->cc_data));
 
     /* Is the terminating timer armed? */
     if (ossl_quic_channel_is_terminating(ch))
@@ -1325,6 +1696,14 @@ static OSSL_TIME ch_determine_next_tick_deadline(QUIC_CHANNEL *ch)
     else if (!ossl_time_is_infinite(ch->idle_deadline))
         deadline = ossl_time_min(deadline,
                                  ch->idle_deadline);
+
+    /*
+     * When do we need to send an ACK-eliciting packet to reset the idle
+     * deadline timer for the peer?
+     */
+    if (!ossl_time_is_infinite(ch->ping_deadline))
+        deadline = ossl_time_min(deadline,
+                                 ch->ping_deadline);
 
     return deadline;
 }
@@ -1407,10 +1786,15 @@ int ossl_quic_channel_set_net_wbio(QUIC_CHANNEL *ch, BIO *net_wbio)
  * QUIC Channel: Lifecycle Events
  * ==============================
  */
-
 int ossl_quic_channel_start(QUIC_CHANNEL *ch)
 {
-    /* TODO(QUIC): handle server */
+    if (ch->is_server)
+        /*
+         * This is not used by the server. The server moves to active
+         * automatically on receiving an incoming connection.
+         */
+        return 0;
+
     if (ch->state != QUIC_CHANNEL_STATE_IDLE)
         /* Calls to connect are idempotent */
         return 1;
@@ -1423,7 +1807,7 @@ int ossl_quic_channel_start(QUIC_CHANNEL *ch)
     if (!ossl_quic_provide_initial_secret(ch->libctx,
                                           ch->propq,
                                           &ch->init_dcid,
-                                          /*is_server=*/0,
+                                          ch->is_server,
                                           ch->qrx, ch->qtx))
         return 0;
 
@@ -1432,22 +1816,23 @@ int ossl_quic_channel_start(QUIC_CHANNEL *ch)
     ch->doing_proactive_ver_neg = 0; /* not currently supported */
 
     /* Handshake layer: start (e.g. send CH). */
-    if (!ossl_quic_dhs_tick(ch->dhs))
+    if (!ossl_quic_tls_tick(ch->qtls))
         return 0;
 
-    ossl_quic_reactor_tick(&ch->rtor); /* best effort */
+    ossl_quic_reactor_tick(&ch->rtor, 0); /* best effort */
     return 1;
 }
 
 /* Start a locally initiated connection shutdown. */
-void ossl_quic_channel_local_close(QUIC_CHANNEL *ch)
+void ossl_quic_channel_local_close(QUIC_CHANNEL *ch, uint64_t app_error_code)
 {
     QUIC_TERMINATE_CAUSE tcause = {0};
 
     if (ossl_quic_channel_is_term_any(ch))
         return;
 
-    tcause.app = 1;
+    tcause.app          = 1;
+    tcause.error_code   = app_error_code;
     ch_start_terminating(ch, &tcause, 0);
 }
 
@@ -1613,7 +1998,7 @@ static void ch_start_terminating(QUIC_CHANNEL *ch,
             ch->state = tcause->remote ? QUIC_CHANNEL_STATE_TERMINATING_DRAINING
                                        : QUIC_CHANNEL_STATE_TERMINATING_CLOSING;
             ch->terminate_deadline
-                = ossl_time_add(ossl_time_now(),
+                = ossl_time_add(get_time(ch),
                                 ossl_time_multiply(ossl_ackm_get_pto_duration(ch->ackm),
                                                    3));
 
@@ -1717,8 +2102,32 @@ static void ch_update_idle(QUIC_CHANNEL *ch)
     if (ch->max_idle_timeout == 0)
         ch->idle_deadline = ossl_time_infinite();
     else
-        ch->idle_deadline = ossl_time_add(ossl_time_now(),
+        ch->idle_deadline = ossl_time_add(get_time(ch),
             ossl_ms2time(ch->max_idle_timeout));
+}
+
+/*
+ * Updates our ping deadline, which determines when we next generate a ping if
+ * we don't have any other ACK-eliciting frames to send.
+ */
+static void ch_update_ping_deadline(QUIC_CHANNEL *ch)
+{
+    if (ch->max_idle_timeout > 0) {
+        /*
+         * Maximum amount of time without traffic before we send a PING to keep
+         * the connection open. Usually we use max_idle_timeout/2, but ensure
+         * the period never exceeds the assumed NAT interval to ensure NAT
+         * devices don't have their state time out (RFC 9000 s. 10.1.2).
+         */
+        OSSL_TIME max_span
+            = ossl_time_divide(ossl_ms2time(ch->max_idle_timeout), 2);
+
+        max_span = ossl_time_min(max_span, MAX_NAT_INTERVAL);
+
+        ch->ping_deadline = ossl_time_add(get_time(ch), max_span);
+    } else {
+        ch->ping_deadline = ossl_time_infinite();
+    }
 }
 
 /* Called when the idle timeout expires. */
@@ -1734,4 +2143,56 @@ static void ch_on_idle_timeout(QUIC_CHANNEL *ch)
     ch->terminate_cause.frame_type  = 0;
 
     ch->state = QUIC_CHANNEL_STATE_TERMINATED;
+}
+
+/* Called when we, as a server, get a new incoming connection. */
+static int ch_server_on_new_conn(QUIC_CHANNEL *ch, const BIO_ADDR *peer,
+                                 const QUIC_CONN_ID *peer_scid,
+                                 const QUIC_CONN_ID *peer_dcid)
+{
+    if (!ossl_assert(ch->state == QUIC_CHANNEL_STATE_IDLE && ch->is_server))
+        return 0;
+
+    /* Generate a SCID we will use for the connection. */
+    if (!gen_rand_conn_id(ch->libctx, INIT_DCID_LEN,
+                          &ch->cur_local_dcid))
+        return 0;
+
+    /* Note our newly learnt peer address and CIDs. */
+    ch->cur_peer_addr   = *peer;
+    ch->init_dcid       = *peer_dcid;
+    ch->cur_remote_dcid = *peer_scid;
+
+    /* Inform QTX of peer address. */
+    if (!ossl_quic_tx_packetiser_set_peer(ch->txp, &ch->cur_peer_addr))
+        return 0;
+
+    /* Inform TXP of desired CIDs. */
+    if (!ossl_quic_tx_packetiser_set_cur_dcid(ch->txp, &ch->cur_remote_dcid))
+        return 0;
+
+    if (!ossl_quic_tx_packetiser_set_cur_scid(ch->txp, &ch->cur_local_dcid))
+        return 0;
+
+    /* Plug in secrets for the Initial EL. */
+    if (!ossl_quic_provide_initial_secret(ch->libctx,
+                                          ch->propq,
+                                          &ch->init_dcid,
+                                          /*is_server=*/1,
+                                          ch->qrx, ch->qtx))
+        return 0;
+
+    /* Register our local DCID in the DEMUX. */
+    if (!ossl_qrx_add_dst_conn_id(ch->qrx, &ch->cur_local_dcid))
+        return 0;
+
+    /* Change state. */
+    ch->state                   = QUIC_CHANNEL_STATE_ACTIVE;
+    ch->doing_proactive_ver_neg = 0; /* not currently supported */
+    return 1;
+}
+
+SSL *ossl_quic_channel_get0_ssl(QUIC_CHANNEL *ch)
+{
+    return ch->tls;
 }

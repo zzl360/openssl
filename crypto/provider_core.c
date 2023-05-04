@@ -417,12 +417,9 @@ OSSL_PROVIDER *ossl_provider_find(OSSL_LIB_CTX *libctx, const char *name,
 #endif
 
         tmpl.name = (char *)name;
-        /*
-         * A "find" operation can sort the stack, and therefore a write lock is
-         * required.
-         */
         if (!CRYPTO_THREAD_write_lock(store->lock))
             return NULL;
+        sk_OSSL_PROVIDER_sort(store->providers);
         if ((i = sk_OSSL_PROVIDER_find(store->providers, &tmpl)) != -1)
             prov = sk_OSSL_PROVIDER_value(store->providers, i);
         CRYPTO_THREAD_unlock(store->lock);
@@ -2160,6 +2157,6 @@ static const OSSL_DISPATCH core_dispatch_[] = {
     { OSSL_FUNC_CORE_OBJ_ADD_SIGID, (void (*)(void))core_obj_add_sigid },
     { OSSL_FUNC_CORE_OBJ_CREATE, (void (*)(void))core_obj_create },
 #endif
-    { 0, NULL }
+    OSSL_DISPATCH_END
 };
 static const OSSL_DISPATCH *core_dispatch = core_dispatch_;

@@ -312,11 +312,16 @@ static void on_regen_notify(uint64_t frame_type, uint64_t stream_id,
                             QUIC_TXPIM_PKT *pkt, void *arg);
 static int sstream_is_pending(QUIC_SSTREAM *sstream);
 static int txp_el_pending(OSSL_QUIC_TX_PACKETISER *txp, uint32_t enc_level,
-                          uint32_t archetype);
+                          uint32_t archetype,
+                          int cc_can_send,
+                          uint32_t *conn_close_enc_level);
 static int txp_generate_for_el(OSSL_QUIC_TX_PACKETISER *txp, uint32_t enc_level,
                                uint32_t archetype,
-                               char is_last_in_dgram,
-                               char dgram_contains_initial);
+                               int cc_can_send,
+                               int is_last_in_dgram,
+                               int dgram_contains_initial,
+                               int chosen_for_conn_close,
+                               int *sent_ack_eliciting);
 static size_t txp_determine_pn_len(OSSL_QUIC_TX_PACKETISER *txp);
 static int txp_determine_ppl_from_pl(OSSL_QUIC_TX_PACKETISER *txp,
                                      size_t pl,
@@ -330,7 +335,9 @@ static int txp_generate_for_el_actual(OSSL_QUIC_TX_PACKETISER *txp,
                                       size_t min_ppl,
                                       size_t max_ppl,
                                       size_t pkt_overhead,
-                                      QUIC_PKT_HDR *phdr);
+                                      QUIC_PKT_HDR *phdr,
+                                      int chosen_for_conn_close,
+                                      int *sent_ack_eliciting);
 
 OSSL_QUIC_TX_PACKETISER *ossl_quic_tx_packetiser_new(const OSSL_QUIC_TX_PACKETISER_ARGS *args)
 {
@@ -471,16 +478,19 @@ int ossl_quic_tx_packetiser_has_pending(OSSL_QUIC_TX_PACKETISER *txp,
                                         uint32_t archetype,
                                         uint32_t flags)
 {
-    uint32_t enc_level;
+    uint32_t enc_level, conn_close_enc_level = QUIC_ENC_LEVEL_NUM;
     int bypass_cc = ((flags & TX_PACKETISER_BYPASS_CC) != 0);
+    int cc_can_send;
 
-    if (!bypass_cc && !txp->args.cc_method->can_send(txp->args.cc_data))
-        return 0;
+    cc_can_send
+        = (bypass_cc
+           || txp->args.cc_method->get_tx_allowance(txp->args.cc_data) > 0);
 
     for (enc_level = QUIC_ENC_LEVEL_INITIAL;
          enc_level < QUIC_ENC_LEVEL_NUM;
          ++enc_level)
-        if (txp_el_pending(txp, enc_level, archetype))
+        if (txp_el_pending(txp, enc_level, archetype, cc_can_send,
+                           &conn_close_enc_level))
             return 1;
 
     return 0;
@@ -492,20 +502,25 @@ int ossl_quic_tx_packetiser_has_pending(OSSL_QUIC_TX_PACKETISER *txp,
  * any ELs which do.
  */
 int ossl_quic_tx_packetiser_generate(OSSL_QUIC_TX_PACKETISER *txp,
-                                     uint32_t archetype)
+                                     uint32_t archetype,
+                                     int *sent_ack_eliciting)
 {
-    uint32_t enc_level;
-    char have_pkt_for_el[QUIC_ENC_LEVEL_NUM], is_last_in_dgram;
+    uint32_t enc_level, conn_close_enc_level = QUIC_ENC_LEVEL_NUM;
+    int have_pkt_for_el[QUIC_ENC_LEVEL_NUM], is_last_in_dgram, cc_can_send;
     size_t num_el_in_dgram = 0, pkts_done = 0;
     int rc;
 
-    if (!txp->args.cc_method->can_send(txp->args.cc_data))
-        return TX_PACKETISER_RES_NO_PKT;
+    /*
+     * If CC says we cannot send we still may be able to send any queued probes.
+     */
+    cc_can_send = (txp->args.cc_method->get_tx_allowance(txp->args.cc_data) > 0);
 
     for (enc_level = QUIC_ENC_LEVEL_INITIAL;
          enc_level < QUIC_ENC_LEVEL_NUM;
          ++enc_level) {
-        have_pkt_for_el[enc_level] = txp_el_pending(txp, enc_level, archetype);
+        have_pkt_for_el[enc_level] = txp_el_pending(txp, enc_level, archetype,
+                                                    cc_can_send,
+                                                    &conn_close_enc_level);
         if (have_pkt_for_el[enc_level])
             ++num_el_in_dgram;
     }
@@ -526,8 +541,11 @@ int ossl_quic_tx_packetiser_generate(OSSL_QUIC_TX_PACKETISER *txp,
             continue;
 
         is_last_in_dgram = (pkts_done + 1 == num_el_in_dgram);
-        rc = txp_generate_for_el(txp, enc_level, archetype, is_last_in_dgram,
-                                 have_pkt_for_el[QUIC_ENC_LEVEL_INITIAL]);
+        rc = txp_generate_for_el(txp, enc_level, archetype, cc_can_send,
+                                 is_last_in_dgram,
+                                 have_pkt_for_el[QUIC_ENC_LEVEL_INITIAL],
+                                 enc_level == conn_close_enc_level,
+                                 sent_ack_eliciting);
 
         if (rc != TXP_ERR_SUCCESS) {
             /*
@@ -733,7 +751,9 @@ static int txp_get_archetype_data(uint32_t enc_level,
  * Always returns 0 if the given EL is discarded.
  */
 static int txp_el_pending(OSSL_QUIC_TX_PACKETISER *txp, uint32_t enc_level,
-                          uint32_t archetype)
+                          uint32_t archetype,
+                          int cc_can_send,
+                          uint32_t *conn_close_enc_level)
 {
     struct archetype_data a;
     uint32_t pn_space = ossl_quic_enc_level_to_pn_space(enc_level);
@@ -742,7 +762,27 @@ static int txp_el_pending(OSSL_QUIC_TX_PACKETISER *txp, uint32_t enc_level,
     if (!ossl_qtx_is_enc_level_provisioned(txp->args.qtx, enc_level))
         return 0;
 
+    if (*conn_close_enc_level > enc_level)
+        *conn_close_enc_level = enc_level;
+
     if (!txp_get_archetype_data(enc_level, archetype, &a))
+        return 0;
+
+    /* Do we need to send a PTO probe? */
+    if (a.allow_force_ack_eliciting) {
+        OSSL_ACKM_PROBE_INFO *probe_info
+            = ossl_ackm_get0_probe_request(txp->args.ackm);
+
+        if ((enc_level == QUIC_ENC_LEVEL_INITIAL
+             && probe_info->anti_deadlock_initial > 0)
+            || (enc_level == QUIC_ENC_LEVEL_HANDSHAKE
+                && probe_info->anti_deadlock_handshake > 0)
+            || probe_info->pto[pn_space] > 0)
+            return 1;
+    }
+
+    if (!cc_can_send)
+        /* If CC says we cannot currently send, we can only send probes. */
         return 0;
 
     /* Does the crypto stream for this EL want to produce anything? */
@@ -774,7 +814,14 @@ static int txp_el_pending(OSSL_QUIC_TX_PACKETISER *txp, uint32_t enc_level,
         return 1;
 
     /* Do we want to produce a CONNECTION_CLOSE frame? */
-    if (a.allow_conn_close && txp->want_conn_close)
+    if (a.allow_conn_close && txp->want_conn_close &&
+        *conn_close_enc_level == enc_level)
+        /*
+         * This is a bit of a special case since CONNECTION_CLOSE can appear in
+         * most packet types, and when we decide we want to send it this status
+         * isn't tied to a specific EL. So if we want to send it, we send it
+         * only on the lowest non-dropped EL.
+         */
         return 1;
 
     /* Does the CFQ have any frames queued for this PN space? */
@@ -843,28 +890,30 @@ static int sstream_is_pending(QUIC_SSTREAM *sstream)
  */
 static int txp_generate_for_el(OSSL_QUIC_TX_PACKETISER *txp, uint32_t enc_level,
                                uint32_t archetype,
-                               char is_last_in_dgram,
-                               char dgram_contains_initial)
+                               int cc_can_send,
+                               int is_last_in_dgram,
+                               int dgram_contains_initial,
+                               int chosen_for_conn_close,
+                               int *sent_ack_eliciting)
 {
-    char must_pad = dgram_contains_initial && is_last_in_dgram;
+    int must_pad = dgram_contains_initial && is_last_in_dgram;
     size_t min_dpl, min_pl, min_ppl, cmpl, cmppl, running_total;
     size_t mdpl, hdr_len, pkt_overhead, cc_limit;
     uint64_t cc_limit_;
     QUIC_PKT_HDR phdr;
-    OSSL_TIME time_since_last;
 
     /* Determine the limit CC imposes on what we can send. */
-    if (ossl_time_is_zero(txp->last_tx_time))
-        time_since_last = ossl_time_zero();
-    else
-        time_since_last = ossl_time_subtract(txp->args.now(txp->args.now_arg),
-                                             txp->last_tx_time);
-
-    cc_limit_ = txp->args.cc_method->get_send_allowance(txp->args.cc_data,
-                                                        time_since_last,
-                                                        ossl_time_is_zero(time_since_last));
-
-    cc_limit = (cc_limit_ > SIZE_MAX ? SIZE_MAX : (size_t)cc_limit_);
+    if (!cc_can_send) {
+        /*
+         * If we are called when we cannot send, this must be because we want
+         * to generate a probe. In this circumstance, don't clamp based on CC.
+         */
+        cc_limit = SIZE_MAX;
+    } else {
+        /* Allow CC to clamp how much we can send. */
+        cc_limit_ = txp->args.cc_method->get_tx_allowance(txp->args.cc_data);
+        cc_limit = (cc_limit_ > SIZE_MAX ? SIZE_MAX : (size_t)cc_limit_);
+    }
 
     /* Assemble packet header. */
     phdr.type           = ossl_quic_enc_level_to_pkt_type(enc_level);
@@ -956,7 +1005,9 @@ static int txp_generate_for_el(OSSL_QUIC_TX_PACKETISER *txp, uint32_t enc_level,
     pkt_overhead = cmpl - cmppl;
 
     return txp_generate_for_el_actual(txp, enc_level, archetype, min_ppl, cmppl,
-                                      pkt_overhead, &phdr);
+                                      pkt_overhead, &phdr,
+                                      chosen_for_conn_close,
+                                      sent_ack_eliciting);
 }
 
 /* Determine how many bytes we should use for the encoded PN. */
@@ -1073,7 +1124,8 @@ static int txp_generate_pre_token(OSSL_QUIC_TX_PACKETISER *txp,
                                   struct tx_helper *h,
                                   QUIC_TXPIM_PKT *tpkt,
                                   uint32_t pn_space,
-                                  struct archetype_data *a)
+                                  struct archetype_data *a,
+                                  int chosen_for_conn_close)
 {
     const OSSL_QUIC_FRAME_ACK *ack;
     OSSL_QUIC_FRAME_ACK ack2;
@@ -1111,7 +1163,7 @@ static int txp_generate_pre_token(OSSL_QUIC_TX_PACKETISER *txp,
     }
 
     /* CONNECTION_CLOSE Frames (Regenerate) */
-    if (a->allow_conn_close && txp->want_conn_close) {
+    if (a->allow_conn_close && txp->want_conn_close && chosen_for_conn_close) {
         WPACKET *wpkt = tx_helper_begin(h);
 
         if (wpkt == NULL)
@@ -1138,6 +1190,11 @@ static int try_len(size_t space_left, size_t orig_len,
 
     *hdr_len = base_hdr_len + lenbytes;
 
+    if (orig_len == 0 && space_left >= *hdr_len) {
+        *payload_len = 0;
+        return 1;
+    }
+
     n = orig_len;
     if (n > maxn_)
         n = maxn_;
@@ -1148,10 +1205,11 @@ static int try_len(size_t space_left, size_t orig_len,
     return n > 0;
 }
 
-static void determine_len(size_t space_left, size_t orig_len,
-                          size_t base_hdr_len,
-                          uint64_t *hlen, uint64_t *len)
+static int determine_len(size_t space_left, size_t orig_len,
+                         size_t base_hdr_len,
+                         uint64_t *hlen, uint64_t *len)
 {
+    int ok = 0;
     size_t chosen_payload_len = 0;
     size_t chosen_hdr_len     = 0;
     size_t payload_len[4], hdr_len[4];
@@ -1174,10 +1232,12 @@ static void determine_len(size_t space_left, size_t orig_len,
         if (valid[i] && payload_len[i] >= chosen_payload_len) {
             chosen_payload_len = payload_len[i];
             chosen_hdr_len     = hdr_len[i];
+            ok                 = 1;
         }
 
     *hlen = chosen_hdr_len;
     *len  = chosen_payload_len;
+    return ok;
 }
 
 /*
@@ -1210,8 +1270,7 @@ static int determine_crypto_len(struct tx_helper *h,
 
     --base_hdr_len;
 
-    determine_len(space_left, orig_len, base_hdr_len, hlen, len);
-    return 1;
+    return determine_len(space_left, orig_len, base_hdr_len, hlen, len);
 }
 
 static int determine_stream_len(struct tx_helper *h,
@@ -1237,15 +1296,14 @@ static int determine_stream_len(struct tx_helper *h,
     if (shdr->has_explicit_len)
         --base_hdr_len;
 
-    determine_len(space_left, orig_len, base_hdr_len, hlen, len);
-    return 1;
+    return determine_len(space_left, orig_len, base_hdr_len, hlen, len);
 }
 
 static int txp_generate_crypto_frames(OSSL_QUIC_TX_PACKETISER *txp,
                                       struct tx_helper *h,
                                       uint32_t pn_space,
                                       QUIC_TXPIM_PKT *tpkt,
-                                      char *have_ack_eliciting)
+                                      int *have_ack_eliciting)
 {
     size_t num_stream_iovec;
     OSSL_QUIC_FRAME_STREAM shdr = {0};
@@ -1278,10 +1336,8 @@ static int txp_generate_crypto_frames(OSSL_QUIC_TX_PACKETISER *txp,
 
         /* Find best fit (header length, payload length) combination. */
         if (!determine_crypto_len(h, &chdr, space_left, &hdr_bytes,
-                                  &chdr.len)
-            || hdr_bytes == 0 || chdr.len == 0) {
+                                  &chdr.len))
             return 1; /* can't fit anything */
-        }
 
         /*
          * Truncate IOVs to match our chosen length.
@@ -1332,7 +1388,7 @@ struct chunk_info {
     OSSL_QUIC_FRAME_STREAM shdr;
     OSSL_QTX_IOVEC iov[2];
     size_t num_stream_iovec;
-    char valid;
+    int valid;
 };
 
 static int txp_plan_stream_chunk(OSSL_QUIC_TX_PACKETISER *txp,
@@ -1395,9 +1451,9 @@ static int txp_generate_stream_frames(OSSL_QUIC_TX_PACKETISER *txp,
                                       QUIC_TXFC *stream_txfc,
                                       QUIC_STREAM *next_stream,
                                       size_t min_ppl,
-                                      char *have_ack_eliciting,
-                                      char *packet_full,
-                                      char *stream_drained,
+                                      int *have_ack_eliciting,
+                                      int *packet_full,
+                                      int *stream_drained,
                                       uint64_t *new_credit_consumed)
 {
     int rc = 0;
@@ -1438,15 +1494,15 @@ static int txp_generate_stream_frames(OSSL_QUIC_TX_PACKETISER *txp,
     for (i = 0;; ++i) {
         space_left = tx_helper_get_space_left(h);
 
-        if (space_left < MIN_FRAME_SIZE_STREAM) {
-            *packet_full = 1;
+        if (!chunks[i % 2].valid) {
+            /* Out of chunks; we're done. */
+            *stream_drained = 1;
             rc = 1;
             goto err;
         }
 
-        if (!chunks[i % 2].valid) {
-            /* Out of chunks; we're done. */
-            *stream_drained = 1;
+        if (space_left < MIN_FRAME_SIZE_STREAM) {
+            *packet_full = 1;
             rc = 1;
             goto err;
         }
@@ -1474,8 +1530,7 @@ static int txp_generate_stream_frames(OSSL_QUIC_TX_PACKETISER *txp,
         shdr->has_explicit_len = 0;
         hdr_len_implicit = payload_len_implicit = 0;
         if (!determine_stream_len(h, shdr, space_left,
-                                  &hdr_len_implicit, &payload_len_implicit)
-            || hdr_len_implicit == 0 || payload_len_implicit == 0) {
+                                  &hdr_len_implicit, &payload_len_implicit)) {
             *packet_full = 1;
             rc = 1;
             goto err; /* can't fit anything */
@@ -1515,8 +1570,7 @@ static int txp_generate_stream_frames(OSSL_QUIC_TX_PACKETISER *txp,
             shdr->has_explicit_len = 1;
             hdr_len_explicit = payload_len_explicit = 0;
             if (!determine_stream_len(h, shdr, space_left,
-                                      &hdr_len_explicit, &payload_len_explicit)
-                || hdr_len_explicit == 0 || payload_len_explicit == 0) {
+                                      &hdr_len_explicit, &payload_len_explicit)) {
                 *packet_full = 1;
                 rc = 1;
                 goto err; /* can't fit anything */
@@ -1527,6 +1581,10 @@ static int txp_generate_stream_frames(OSSL_QUIC_TX_PACKETISER *txp,
             shdr->has_explicit_len = 0;
             shdr->len = payload_len_implicit;
         }
+
+        /* If this is a FIN, don't keep filling the packet with more FINs. */
+        if (shdr->is_fin)
+            chunks[(i + 1) % 2].valid = 0;
 
         /* Truncate IOVs to match our chosen length. */
         ossl_quic_sstream_adjust_iov((size_t)shdr->len, chunks[i % 2].iov,
@@ -1607,7 +1665,7 @@ static int txp_generate_stream_related(OSSL_QUIC_TX_PACKETISER *txp,
                                        uint32_t pn_space,
                                        QUIC_TXPIM_PKT *tpkt,
                                        size_t min_ppl,
-                                       char *have_ack_eliciting,
+                                       int *have_ack_eliciting,
                                        QUIC_STREAM **tmp_head)
 {
     QUIC_STREAM_ITER it;
@@ -1708,7 +1766,7 @@ static int txp_generate_stream_related(OSSL_QUIC_TX_PACKETISER *txp,
 
         /* Stream Data Frames (STREAM) */
         if (stream->sstream != NULL) {
-            char packet_full = 0, stream_drained = 0;
+            int packet_full = 0, stream_drained = 0;
 
             if (!txp_generate_stream_frames(txp, h, pn_space, tpkt,
                                             stream->id, stream->sstream,
@@ -1748,25 +1806,39 @@ static int txp_generate_for_el_actual(OSSL_QUIC_TX_PACKETISER *txp,
                                       size_t min_ppl,
                                       size_t max_ppl,
                                       size_t pkt_overhead,
-                                      QUIC_PKT_HDR *phdr)
+                                      QUIC_PKT_HDR *phdr,
+                                      int chosen_for_conn_close,
+                                      int *sent_ack_eliciting)
 {
     int rc = TXP_ERR_SUCCESS;
     struct archetype_data a;
     uint32_t pn_space = ossl_quic_enc_level_to_pn_space(enc_level);
     struct tx_helper h;
-    char have_helper = 0, have_ack_eliciting = 0, done_pre_token = 0;
-    char require_ack_eliciting;
+    int have_helper = 0, have_ack_eliciting = 0, done_pre_token = 0;
+    int require_ack_eliciting = 0;
     QUIC_CFQ_ITEM *cfq_item;
     QUIC_TXPIM_PKT *tpkt = NULL;
     OSSL_QTX_PKT pkt;
     QUIC_STREAM *tmp_head = NULL, *stream;
+    OSSL_ACKM_PROBE_INFO *probe_info
+        = ossl_ackm_get0_probe_request(txp->args.ackm);
 
     if (!txp_get_archetype_data(enc_level, archetype, &a))
         goto fatal_err;
 
-    require_ack_eliciting
-        = (a.allow_force_ack_eliciting
-           && (txp->force_ack_eliciting & (1UL << pn_space)));
+    if (a.allow_force_ack_eliciting) {
+        /*
+         * Make this packet ACK-eliciting if it has been explicitly requested,
+         * or if ACKM has requested a probe for this PN space.
+         */
+        if ((txp->force_ack_eliciting & (1UL << pn_space)) != 0
+            || (enc_level == QUIC_ENC_LEVEL_INITIAL
+                && probe_info->anti_deadlock_initial > 0)
+            || (enc_level == QUIC_ENC_LEVEL_HANDSHAKE
+                && probe_info->anti_deadlock_handshake > 0)
+            || probe_info->pto[pn_space] > 0)
+            require_ack_eliciting = 1;
+    }
 
     /* Minimum cannot be bigger than maximum. */
     if (min_ppl > max_ppl)
@@ -1921,7 +1993,8 @@ static int txp_generate_for_el_actual(OSSL_QUIC_TX_PACKETISER *txp,
                  * NEW_TOKEN frames in the GCR queue we will handle these below.
                  */
                 if (!done_pre_token)
-                    if (txp_generate_pre_token(txp, &h, tpkt, pn_space, &a))
+                    if (txp_generate_pre_token(txp, &h, tpkt, pn_space, &a,
+                                               chosen_for_conn_close))
                         done_pre_token = 1;
 
                 break;
@@ -1954,7 +2027,8 @@ static int txp_generate_for_el_actual(OSSL_QUIC_TX_PACKETISER *txp,
      * PATH_RESPONSE (as desired) before, do so now.
      */
     if (!done_pre_token)
-        if (txp_generate_pre_token(txp, &h, tpkt, pn_space, &a))
+        if (txp_generate_pre_token(txp, &h, tpkt, pn_space, &a,
+                                   chosen_for_conn_close))
             done_pre_token = 1;
 
     /* CRYPTO Frames */
@@ -2129,6 +2203,27 @@ static int txp_generate_for_el_actual(OSSL_QUIC_TX_PACKETISER *txp,
 
     if (tpkt->had_ack_frame)
         txp->want_ack &= ~(1UL << pn_space);
+
+    /*
+     * Decrement probe request counts if we have sent a packet that meets
+     * the requirement of a probe, namely being ACK-eliciting.
+     */
+    if (have_ack_eliciting) {
+        if (enc_level == QUIC_ENC_LEVEL_INITIAL
+            && probe_info->anti_deadlock_initial > 0)
+            --probe_info->anti_deadlock_initial;
+
+        if (enc_level == QUIC_ENC_LEVEL_HANDSHAKE
+            && probe_info->anti_deadlock_handshake > 0)
+            --probe_info->anti_deadlock_handshake;
+
+        if (a.allow_force_ack_eliciting /* (i.e., not for 0-RTT) */
+            && probe_info->pto[pn_space] > 0)
+            --probe_info->pto[pn_space];
+    }
+
+    if (have_ack_eliciting)
+        *sent_ack_eliciting = 1;
 
     /* Done. */
     tx_helper_cleanup(&h);

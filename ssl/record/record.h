@@ -7,10 +7,8 @@
  * https://www.openssl.org/source/license.html
  */
 
-typedef struct ssl_connection_st SSL_CONNECTION;
-
 #include <openssl/core_dispatch.h>
-#include "recordmethod.h"
+#include "internal/recordmethod.h"
 
 /*****************************************************************************
  *                                                                           *
@@ -26,7 +24,12 @@ typedef struct tls_record_st {
     int version;
     int type;
     /* The data buffer containing bytes from the record */
-    unsigned char *data;
+    const unsigned char *data;
+    /*
+     * Buffer that we allocated to store data. If non NULL always the same as
+     * data (but non-const)
+     */
+    unsigned char *allocdata;
     /* Number of remaining to be read in the data buffer */
     size_t length;
     /* Offset into the data buffer where to start reading */
@@ -74,6 +77,10 @@ typedef struct record_layer_st {
     /* The parent SSL_CONNECTION structure */
     SSL_CONNECTION *s;
 
+    /* Custom record layer: always selected if set */
+    const OSSL_RECORD_METHOD *custom_rlmethod;
+    /* Record layer specific argument */
+    void *rlarg;
     /* Method to use for the read record layer*/
     const OSSL_RECORD_METHOD *rrlmethod;
     /* Method to use for the write record layer*/
@@ -158,7 +165,7 @@ __owur int dtls1_write_bytes(SSL_CONNECTION *s, int type, const void *buf,
 int do_dtls1_write(SSL_CONNECTION *s, int type, const unsigned char *buf,
                    size_t len, size_t *written);
 void dtls1_increment_epoch(SSL_CONNECTION *s, int rw);
-void ssl_release_record(SSL_CONNECTION *s, TLS_RECORD *rr);
+int ssl_release_record(SSL_CONNECTION *s, TLS_RECORD *rr, size_t length);
 
 # define HANDLE_RLAYER_READ_RETURN(s, ret) \
     ossl_tls_handle_rlayer_return(s, 0, ret, OPENSSL_FILE, OPENSSL_LINE)
@@ -169,13 +176,15 @@ void ssl_release_record(SSL_CONNECTION *s, TLS_RECORD *rr);
 int ossl_tls_handle_rlayer_return(SSL_CONNECTION *s, int writing, int ret,
                                   char *file, int line);
 
-int ssl_set_new_record_layer(SSL_CONNECTION *s, int version, int direction,
-                             int level, unsigned char *key, size_t keylen,
+int ssl_set_new_record_layer(SSL_CONNECTION *s, int version,
+                             int direction, int level,
+                             unsigned char *secret, size_t secretlen,
+                             unsigned char *key, size_t keylen,
                              unsigned char *iv,  size_t ivlen,
                              unsigned char *mackey, size_t mackeylen,
                              const EVP_CIPHER *ciph, size_t taglen,
                              int mactype, const EVP_MD *md,
-                             const SSL_COMP *comp);
+                             const SSL_COMP *comp, const EVP_MD *kdfdigest);
 int ssl_set_record_protocol_version(SSL_CONNECTION *s, int vers);
 
 # define OSSL_FUNC_RLAYER_SKIP_EARLY_DATA        1

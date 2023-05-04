@@ -348,15 +348,22 @@ static int get_cert_by_subject_ex(X509_LOOKUP *xl, X509_LOOKUP_TYPE type,
 
         /*
          * we have added it to the cache so now pull it out again
+         *
+         * Note: quadratic time find here since the objects won't generally be
+         *       sorted and sorting the would result in O(n^2 log n) complexity.
          */
         X509_STORE_lock(xl->store_ctx);
         j = sk_X509_OBJECT_find(xl->store_ctx->objs, &stmp);
         tmp = sk_X509_OBJECT_value(xl->store_ctx->objs, j);
         X509_STORE_unlock(xl->store_ctx);
 
-        /* If a CRL, update the last file suffix added for this */
-
-        if (type == X509_LU_CRL) {
+        /*
+         * If a CRL, update the last file suffix added for this.
+         * We don't need to add an entry if k is 0 as this is the initial value.
+         * This avoids the need for a write lock and sort operation in the
+         * simple case where no CRL is present for a hash.
+         */
+        if (type == X509_LU_CRL && k > 0) {
             if (!CRYPTO_THREAD_write_lock(ctx->lock))
                 goto finish;
             /*
@@ -384,6 +391,12 @@ static int get_cert_by_subject_ex(X509_LOOKUP *xl, X509_LOOKUP_TYPE type,
                     ok = 0;
                     goto finish;
                 }
+
+                /*
+                 * Ensure stack is sorted so that subsequent sk_BY_DIR_HASH_find
+                 * will not mutate the stack and therefore require a write lock.
+                 */
+                sk_BY_DIR_HASH_sort(ent->hashes);
             } else if (hent->suffix < k) {
                 hent->suffix = k;
             }
@@ -407,6 +420,13 @@ static int get_cert_by_subject_ex(X509_LOOKUP *xl, X509_LOOKUP_TYPE type,
         }
     }
  finish:
+    /* If we changed anything, resort the objects for faster lookup */
+    if (!sk_X509_OBJECT_is_sorted(xl->store_ctx->objs)) {
+        X509_STORE_lock(xl->store_ctx);
+        sk_X509_OBJECT_sort(xl->store_ctx->objs);
+        X509_STORE_unlock(xl->store_ctx);
+    }
+
     BUF_MEM_free(b);
     return ok;
 }
